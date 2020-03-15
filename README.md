@@ -1,13 +1,13 @@
-# PyMDA  Microcrystal data assembly using Python, a program for facilitating macromolecular crystallographic data processing. 
-# The purpose of the program is to help to process and assemble partial diffraction data sets that have been collected with rotational methods. The most typical application is to assemble small-wedge data sets from micro-sized biological crystals. 
+PyMDA  Microcrystal data assembly using Python, a program for facilitating macromolecular crystallographic data processing. 
+The purpose of the program is to help to process and assemble partial diffraction data sets that have been collected with rotational methods. The most typical application is to assemble small-wedge data sets from micro-sized biological crystals. 
 
-# Details usage of the program: https://doi.org/10.1107/S160057671901673X
+Details usage of the program: https://doi.org/10.1107/S160057671901673X
 
-# The program requires the installation of DIALS (for single-crystal data processing) and CCP4 (for assembly).
-# DIALS: Diffraction Integration for Advanced Light Sources, https://dials.github.io/  
-# CCP4: Software for Macromolecular X-Ray Crystallography, https://www.ccp4.ac.uk/
+The program requires the installation of DIALS (for single-crystal data processing) and CCP4 (for assembly).
+DIALS: Diffraction Integration for Advanced Light Sources, https://dials.github.io/  
+CCP4: Software for Macromolecular X-Ray Crystallography, https://www.ccp4.ac.uk/
 
-# Examples of using the program: 
+Examples of using the program: 
 1. Processing hdf5 format data typical from a dectris Eiger detector:
 /path-to-pymda/pymda --run_dials --hdf5_path /root-path-containing-hdf5-data/ --wedges 10 --spg p2221 --thread 4
 
