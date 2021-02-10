@@ -166,7 +166,7 @@ def dOptimize(frame,dmin,spg, minspot, sigb, sigs):
 	grid_list=[[]]
 	for minspot in range(2,6,2):
 		for sigb in range(2,5,2):
-			for sigs in range(2,5): 
+			for sigs in range(2,5,2): 
 				#print minspot, sigb, sigs
 				dFindspots2(frame,dmin,minspot,sigb,sigs)
 				dIndex(frame, spg)
