@@ -3,7 +3,7 @@
 #  Authors: 
 #  Qun Liu: qun.liu@gmail.com
 #  Lina Takamaru:  llt45@cornell.edu
-#  References:  J. Appl. Cryst. (2020). 53 https://doi.org/10.1107/S160057671901673X
+#  references 
 
 import os, sys, glob, pprint, collections, re, subprocess, shutil, math, argparse
 import picc_rejection, uc_rejection, helpers, autoDials
@@ -47,7 +47,7 @@ def setOptions():
 	parser.add_argument("--unit_cell", dest="unit_cell", metavar="STRING", default = None, nargs = 1, 
 			help="six unit cell parameters,seperated by a comma if known")
 	parser.add_argument("--minspot", dest="minspot", metavar="VALUE", default=4,type=int)
-	parser.add_argument("--sigb", dest="sigb", metavar="VALUE", default=5,type=int)
+	parser.add_argument("--sigb", dest="sigb", metavar="VALUE", default=2,type=int)
 	parser.add_argument("--sigs", dest="sigs", metavar="VALUE", default=2,type=int)
 	parser.add_argument("--cc_cutoff", dest="cccutoff", metavar="VALUE", default=0.4,type=float )
 
@@ -165,8 +165,8 @@ def f(x): #for multiprocessing only for dials
 def dOptimize(frame,dmin,spg, minspot, sigb, sigs):
 	grid_list=[[]]
 	for minspot in range(2,6,2):
-		for sigb in range(3,7,2):
-			for sigs in range(2,4): 
+		for sigb in range(2,5,2):
+			for sigs in range(2,5): 
 				#print minspot, sigb, sigs
 				dFindspots2(frame,dmin,minspot,sigb,sigs)
 				dIndex(frame, spg)
@@ -384,7 +384,7 @@ if __name__ == '__main__':
 						for x in range(len(Tmp3b)):
 							#smr.write(Tmp3b[x][0] + '\n')
 							num = int(Tmp3b[x][0]) - 1 ### list starts from zero 
-							print("tt2:",x, num, cc12sorted[num][0], cc12sorted[num][1][0])
+							#print("tt2:",x, num, cc12sorted[num][0], cc12sorted[num][1][0])
 							trackFold.append(cc12sorted[num][0])
 							trackFiles.append(cc12sorted[num][1][0])
 							tmp4.write('HKLIN ' + str(cc12sorted[num][0])+ "/integrated_" + str(cc12sorted[num][0]) + "_" + str(cc12sorted[num][1][0]) + ".mtz" + "\n")
@@ -428,7 +428,7 @@ if __name__ == '__main__':
 						for x in range(len(Tmp3b)):
 							#smr.write(Tmp3b[x][0] + '\n')
 							num = int(Tmp3b[x][0]) - 1  ## list starts from zero 
-							print("tt:",x, num, cc12sorted[num][0], cc12sorted[num][1][0])
+							#print("tt:",x, num, cc12sorted[num][0], cc12sorted[num][1][0])
 							trackFold.append(cc12sorted[num][0])
 							trackFiles.append(cc12sorted[num][1][0])
 							tmp4.write('HKLIN ' + str(cc12sorted[num][0])+ "/integrated_" + str(cc12sorted[num][0]) + "_" + str(cc12sorted[num][1][0]) + ".mtz" + "\n")

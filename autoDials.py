@@ -2,7 +2,7 @@
 #  Authors: 
 #  Qun Liu: qun.liu@gmail.com
 #  Lina Takamaru:  llt45@cornell.edu
-#  References:  J. Appl. Cryst. (2020). 53 https://doi.org/10.1107/S160057671901673X
+#  references 
 import os, subprocess, argparse
 
 def dImport(frame, images):
@@ -24,7 +24,7 @@ def dFindspots(frame,dmin,minspot,sigb,sigs):
 def dFindspots2(frame,dmin,minspot,sigb,sigs):
 	if os.path.exists('strong.pickle'):
 		os.remove('strong.pickle')
-	cmd = 'dials.find_spots datablock.json min_spot_size=%i xds.sigma_background=%i xds.sigma_strong=%i scan_range=1,%i filter.d_min=%f nproc=6' %(minspot,sigb,sigs,frame,dmin)
+	cmd = 'dials.find_spots datablock.json min_spot_size=%i background_size=%i gradient_cutoff=%i scan_range=1,%i filter.d_min=%f nproc=6' %(minspot,sigb,sigs,frame,dmin)
 	#cmd = 'dials.find_spots datablock.json scan_range=1,%i filter.d_min=%f nproc=4' %(frame,dmin)
 	print cmd
 	subprocess.Popen(cmd,shell=True, stdout=subprocess.PIPE,stderr=subprocess.PIPE).communicate()
@@ -125,7 +125,7 @@ def dAimless20(res):
 			os.remove(files)
 
 	aim = "aimless hklin sorted.mtz hklout scaled.mtz <<eof > aimless.log\nbins 20\nanalysis groupbatch 1\nresolution 40 " + str(res) + "\nrefine parallel auto\nUSESDPARAMETER NO\nend\neof\n"
-	#print aim
+	print aim
 	subprocess.Popen(aim,shell=True).wait()
 	
 	
@@ -136,8 +136,8 @@ def dAimless2(res, dir_output):
 		lns = tmpa.readlines()
 	for x in range(len(lns)):
 		aim += str(lns[x][:-1])+'\n'
-	aim += 'bins 20\nresolution 40\nanalysis groupbatch 1 ' + str(res)+'\nrefine parallel auto\nUSESDPARAMETER NO\nend\neof'
-	#print aim
+	aim += 'bins 20\nresolution 40  ' + str(res)+'\nanalysis groupbatch 1 \nrefine parallel auto\nUSESDPARAMETER NO\nend\neof'
+	print aim
 	subprocess.Popen(aim,shell=True).wait()	
 
 ### run truncate, mtzvarious, and freeR
