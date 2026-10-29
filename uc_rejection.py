@@ -1,77 +1,40 @@
-#!/bin/env python
+"""Unit-cell clustering retained for standalone use."""
+from pathlib import Path
 
-# free to use or modify
-#  Authors: 
-#  Qun Liu: qun.liu@gmail.com
-#  Lina Takamaru:  llt45@cornell.edu
-#  References:  J. Appl. Cryst. (2020). 53 https://doi.org/10.1107/S160057671901673X
 
-from scipy.cluster import vq
-from scipy.cluster.hierarchy import linkage, dendrogram, to_tree, fcluster
-from matplotlib.pyplot import *
-import sys
-from numpy import genfromtxt
-from scipy import io
-import os
-
-def llf(id):
-    return str(id+1)
-
-def get_cluster_elements(clust):
-    # return ids for elements in a cluster sub-tree
-    #if clust.id>0:
-    if clust.is_leaf():
-        # positive id means that this is a leaf
-        return [clust.get_id()]
+def ucr(data, nClusters, dir_output, single=False):
+    import numpy as np
+    from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    cells = np.loadtxt(data, delimiter=',', ndmin=2)
+    if cells.shape[0] == 0 or not np.isfinite(cells).all():
+        raise ValueError('Unit cells must contain finite values')
+    if nClusters < 1:
+        raise ValueError('Cluster count must be positive')
+    out = Path(dir_output)
+    out.mkdir(parents=True, exist_ok=True)
+    if len(cells) == 1:
+        assignments = np.ones(1, dtype=int)
     else:
-        # check the right and left branches
-        cl = []
-        cr = []
-        if clust.get_left()!=None:
-            cl = get_cluster_elements(clust.get_left())
-        if clust.get_right()!=None:
-            cr = get_cluster_elements(clust.get_right())
-        return cl+cr
+        # Retain every cell parameter, including constant crystallographic angles.
+        # Standardize only dimensions with nonzero variance for single linkage.
+        if single:
+            scale = cells.std(axis=0)
+            scale[scale == 0] = 1
+            tree = linkage(cells / scale, method='single')
+        else:
+            tree = linkage(cells, method='ward')
+        assignments = fcluster(tree, min(nClusters, len(cells)), criterion='maxclust')
+        fig, ax = plt.subplots()
+        dendrogram(tree, orientation='right', labels=[str(i+1) for i in range(len(cells))], ax=ax)
+        fig.savefig(out / 'unit_cell_classes.pdf', bbox_inches='tight')
+        plt.close(fig)
+    result = [[int(c), i+1] for i, c in enumerate(assignments)]
+    (out/'cluster.txt').write_text(''.join('cluster%sq %s\n' % tuple(x) for x in result))
+    return result
 
-def ucr(data, nClusters, dir_output,single):
-	cls_list = []
-	data = genfromtxt(data,comments='#', delimiter =",")
-    	n_clusters = int(nClusters)
-    	nsets =len(data) - 1
-    	if single == True: 
-    		li = linkage(data,method='single', metric='seuclidean')
-    	else:
-    		li = linkage(data,method='ward', metric='euclidean')
-    	tree, mapper = to_tree(li,rd=True)
-    	clusters=fcluster(li,n_clusters,criterion='maxclust')
-    	
-	if os.path.exists(dir_output + '/cluster.txt'):
-		os.remove(dir_output + '/cluster.txt')
-	
-	clust = open(dir_output+"/cluster.txt", "a")
-	for i_cluster in range(1,n_clusters+1):
-		for leaves in range(nsets+1):
-			if clusters[leaves] == i_cluster:
-				print "cluster" + str(i_cluster) + "q",  leaves+1
-				cls_list.append([i_cluster, leaves+1])
-				clust.write("cluster" + str(i_cluster) + "q " + str(leaves+1) + "\n")
-	clust.close()
-	
-    	test=dendrogram(li,color_threshold=200,orientation='right', leaf_label_func=llf)
-    	#xlim((5, 0))
-    	xmin,xmax = xlim()
-    	matplotlib.rcParams.update({'lines.color': '#112233'})
-    	ax = gca()
-    	for line in ax.xaxis.get_ticklines():
-       	 	line.set_markeredgewidth(2)
-    	savefig(dir_output+'/unit_cell_classes.pdf')#,transparent=True)
-	#os.rename(dir_output+'/unit_cell_single.png', dir_output + '/c_unit_cell_single.png')	
-	#print("list:", cls_list)
-	return cls_list
 
 def single(n_data, nClusters, dir_output):
-	cls_list = []
-	for i in range(1, n_data+1):
-		cls_list.append([nClusters, i])
-		print "cluster: ", nClusters, i 
-	return cls_list
+    return [[nClusters, i] for i in range(1, n_data+1)]

@@ -1,553 +1,347 @@
-#!/bin/env python 
-# free to use or modify
-#  Authors: 
-#  Qun Liu: qun.liu@gmail.com
-#  Lina Takamaru:  llt45@cornell.edu
-#  references 
+#!/usr/bin/env python3
+"""Microcrystal data assembly with current DIALS and CCP4.
 
-import os, sys, glob, pprint, collections, re, subprocess, shutil, math, argparse
-import picc_rejection, uc_rejection, helpers, autoDials
-from multiprocessing import Pool
-from numpy import arange
-
+Compare cumulative frame prefixes and crystal subsets; retain all trials and
+select supported resolution first, then merged I/sigma(I).
 """
-main usage of pymda 
- 1. examples of processing hdf5 format Eiger data by using dials  
- /share/apps/pymda/pymda  --run_dials  --hdf5_path /share/d1/nsls2/ping/uxtal/FMX_20190905/BNL_136_13_C1  --wedges 10   --spg p2221
-/share/apps/pymda/pymda  --run_dials  --hdf5_path /share/d1/nsls2/ping/uxtal/FMX_20190920  --wedges 10  --spg p2221 --thread 4
+import argparse
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import hashlib
+import itertools
+import json
+from pathlib import Path
+import shutil
+import sys
+from autoDials import Toolchain
+from helpers import discover_masters, dataset_id, aimless_stats, admissible
 
- 2. examples of running microcrystal data assembly with 1 or 2 classes and with xtal and frame rejections
- /share/apps/pymda/pymda  --run_mda --dataprefix BNL --ucr 10 
- /share/apps/pymda/pymda  --run_mda --dataprefix BNL --ucr 10 --data sm_sep  --rjxtal --xtal_steps 10  --reso 5.0
- /share/apps/pymda/pymda  --run_mda --dataprefix BNL --ucr 1 --rjxtal --xtal_steps 5 --rjframe  --reso 3.0
- /share/apps/pymda/pymda  --run_mda --dataprefix BNL --ucr 2 --rjxtal --xtal_steps 5 --rjframe  --decay "4.0 3.0 2.0 1.0"
- /share/apps/pymda/pymda  --run_mda --run_picc --dataprefix BNL --ucr  1  --rjxtal --xtal_steps 5 --rjframe 
- /share/apps/pymda/pymda  --run_mda --dataprefix  BNL --data smUxtl --ucr 20  --rjxtal --xtal_steps 10 --reso 3 --rjframe --decay "5.0 3.0 2.0 1.0"
-"""
-def setOptions():
-	parser = argparse.ArgumentParser()
-	parser.add_argument("--hdf5_path", dest="hdf5_path", metavar="DIRECTORY",default="blank", 
-			help="Absolute path of raw hdf5 data directory, required to run_dials")
-	parser.add_argument("--dataprefix", dest="dataprefix", metavar="DIRECTORY",default="test", 
-			help="The prefix of directories that contain integrated data from run_dials, required for assembly")
-	parser.add_argument("--dir_output", dest="dir_output", metavar="DIRECTORY",default=os.getcwd(), 
-			help="the absolution path for output data directory, default is the current directory.")
-	parser.add_argument("--data", dest="data", metavar="STRING", default='output', 
-			help="use a meaningful prefix for assembled data sets")
-	parser.add_argument("--frames", dest="frames", metavar="VALUE", default=10, type=int, 
-			help="number of frames in a data set")
-	parser.add_argument("--reso", dest="reso", metavar="VALUE", default=3.0, 
-			help="resolution limit in angstrom for index and integration")
-	parser.add_argument("--reso_cchalf", dest="reso2", metavar="VALUE", default=4.0,
-			help="resolution limit in angstroms for pointless and aimless for statistics and wedges selection, should be ~1 angstrom lower than reso ")
-	parser.add_argument("--wedges", dest='wedges', metavar='VALUE', default=10,type=int, 
-			help='number of wedges to split a single data set')
-	parser.add_argument("--spg", dest="spg", metavar='VALUE', default='p1', type=str,
-			help="space group if known")
-	parser.add_argument("--unit_cell", dest="unit_cell", metavar="STRING", default = None, nargs = 1, 
-			help="six unit cell parameters,seperated by a comma if known")
-	parser.add_argument("--minspot", dest="minspot", metavar="VALUE", default=4,type=int)
-	parser.add_argument("--sigb", dest="sigb", metavar="VALUE", default=2,type=int)
-	parser.add_argument("--sigs", dest="sigs", metavar="VALUE", default=2,type=int)
-	parser.add_argument("--cc_cutoff", dest="cccutoff", metavar="VALUE", default=0.4,type=float )
 
-	parser.add_argument("--decay",dest="decay", metavar="STRING", default="4.0 2.0 1.0",  type=str,
-			help="decay is a list of space-seprated values to determine the conditions of frame rejection.")
-	parser.add_argument("--picc", dest="picc",  metavar="INT", default=2,  type=int, 
-			help="number of classes for classification based on 1-picc ")
-	parser.add_argument("--run_picc", dest="run_picc", default=False, action='store_true',  
-			help="where to use 1-picc for classification")
-	parser.add_argument("--ucr", dest="ucr", default=2, metavar="VALUE", type=int,  
-			help="number of clusters to be used for unit cell rejection")
-	parser.add_argument("--tolerance",dest="tolerance",  metavar="VALUE",type=int, default=16,  
-			help="unit-cell tolerance used for pointless")
-	parser.add_argument("--xtal_steps",dest="xtal_steps",  metavar="VALUE", type=int, default=2,  
-			help="number of steps/datasets for xtal rejection")
-	parser.add_argument("--frame_steps", dest="frame_steps", metavar="VALUE", type=int, default=5,  
-			help="number of steps used for frame rejection")
-	parser.add_argument("--nres", dest="nres", metavar="VALUE", default=400,type=int,  
-			help="Estimated total number of molecules in a.u.")
-	parser.add_argument("--thread", dest="thread",  metavar="INT",type=int, default=1, 
-			help="number of cores to be used for dials")
-	parser.add_argument("--opt", dest="opt", default=False,  action='store_true', 
-			help="enable grid search for spotfind in dials")
-	parser.add_argument("--run_dials", dest="run_dials",default=False, action='store_true', 
-			help="run dials for data processing, require to know the --path")
-	parser.add_argument("--fix_detector", dest="fix_detector",default=False, action='store_true', 
-			help="run dials indexing and refine with a fixed detector distance")
-	parser.add_argument("--run_mda", dest="run_mda",default=False, action='store_true', 
-			help="run microdiffraction data assembly, require to known the directores that contain data processed by dials")
-	parser.add_argument("--rjxtal", dest="rjxtal", default=False, action='store_true', 
-			help="run xtal rejection")
-	parser.add_argument("--rjframe", dest="rjframe", default=False, action='store_true', 
-			help="run frame rejection")
-	parser.add_argument("--single", dest="single", default=False, action='store_true', 
-			help="use single or ward for unit cell classification")
-	args = parser.parse_args()
-	return args
+def options():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--ccp4', default='/home/aa1/ccp47')
+    p.add_argument('--hdf5_path', default='~/.codex/pymda_data')
+    p.add_argument('--master_files', nargs='+', help='Process only these discovered rotation master files')
+    p.add_argument('--dir_output', default='~/.codex/pymda_output')
+    p.add_argument('--run_dials', action='store_true')
+    p.add_argument('--run_mda', action='store_true')
+    p.add_argument('--discover', action='store_true')
+    p.add_argument('--exports_only', action='store_true', help='Recover exports and merging from completed integrations without reading raw images')
+    p.add_argument('--thread', type=int, default=2)
+    p.add_argument('--merge_workers', type=int, help='Independent merging jobs; defaults to thread count, capped at four')
+    p.add_argument('--wedges', type=int, default=4, help='Number of cumulative frame prefixes per crystal')
+    p.add_argument('--frames', type=int, help='Optional maximum frames per crystal')
+    p.add_argument('--reso', type=float, default=1.8, help='Integration high-resolution limit, A')
+    p.add_argument('--reso_cchalf', type=float, default=2.5, help='Common resolution for prefix selection')
+    p.add_argument('--resolutions', type=float, nargs='+', default=[1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 3.0])
+    p.add_argument('--spg', help='Known space group; otherwise index without imposing symmetry')
+    p.add_argument('--unit_cell')
+    p.add_argument('--fix_detector', action='store_true')
+    p.add_argument('--min_completeness', type=float, default=90, help='Overall completeness threshold (paper uses over 90 percent)')
+    p.add_argument('--min_outer_completeness', type=float, default=80)
+    p.add_argument('--prefix_policy', choices=['selected', 'cchalf', 'full', 'both', 'all'], default='all', help='Compare I/sigma-selected, CC-half-selected and full-scan prefixes')
+    p.add_argument('--min_cc_half', type=float, default=0.3)
+    p.add_argument('--min_isigi', type=float, default=1.0, help='Minimum outer-shell merged I/sigma(I)')
+    p.add_argument('--nres', type=int, help='Known number of residues in the asymmetric unit')
+    p.add_argument('--crystal_identity', choices=['unknown', 'repeat', 'independent'], default='unknown', help='Identity established by collection metadata; not inferred from unit cells')
+    return p.parse_args()
 
-def f(x): #for multiprocessing only for dials 
-	options = setOptions()
-	wedges=options.wedges
-	minspot = options.minspot
-	sigb = options.sigb
-	sigs = options.sigs
-	reso1 = float(options.reso)
-	#print("res:", reso1)
-	reso2 = float(options.reso2)
-	spg = options.spg
-	uc=options.unit_cell
-	frames = options.frames
-	fix_detector = options.fix_detector
-	dir_output = options.dir_output
-	os.chdir(dir_output)
-	#print "here we are before: ", os.getcwd()  
-	if options.opt == True:
-		print("optimizing spot finding parameters ...")
-		maxopt = dOptimize(frame, reso1, spg, minspot,sigb,sigs)
-		minspot = maxopt[1]
-		sigb = maxopt[2]
-		sigs = maxopt[3]
-	root = x.split()[0]
-	dirfile = x.split()[1]
-	dname = dirfile
-	os.chdir(dirfile)
-	ipt = root+'/'+dirfile+'_master.h5'
-	#print "ipt", ipt
-##  import raw data  
-	autoDials.dImport(frames, ipt)
-	imt = open('dials.import.log', 'r')
-	lines = imt.readlines()
-	imt.close()	
-	frameinfo = {}
-	for line in lines:
-		line = line.strip()
-		if line[0:12] == 'num images: ':
-			findC = line.find(':')
-			frameinfo['frames'] = line[findC+2:]
-			frames = int(line[findC+2:])
-			print("data set:",  dirfile, "Total number of frames is " + str(frames))
 
-##  index & integration 
-	steps = int(math.ceil(float(frames)/wedges))
-	if os.path.exists('datablock.json'):
-		autoDials.dFindspots2(frames,reso1,minspot,sigb,sigs)
-		for frame2 in range(steps, frames+2, steps):
-			if frame2 > frames:
-				frame2 = frames
-			if os.path.exists('strong.pickle'):
-				if uc == None:
-					autoDials.dIndex(frame2,spg,fix_detector)
-				else:
-					autoDials.dIndex2(frame2,spg,uc,fix_detector)
-				if os.path.exists('experiments.json'):	
-					autoDials.dRefine()
-					if os.path.exists('refined_experiments.json'):
-						autoDials.dIntegrate(reso1,frame2)
-						if os.path.exists('integrated.pickle'):
-							autoDials.dExport()
-							if os.path.exists('integrated.mtz'):
-								autoDials.dPointless()
-								autoDials.dAimless(reso2)
-						if os.path.exists('integrated.mtz'):
-							os.rename('integrated.mtz','integrated_%s_%i.mtz' %(dname,frame2))
-						if os.path.exists('dials.integrate.log'):
-							os.rename('dials.integrate.log','dials.integrate_%s_%i.log' %(dname,frame2))
-						if os.path.exists('scaled.mtz'):
-							os.rename('scaled.mtz','scaled_%s_%i.mtz' %(dname,frame2))
-						if os.path.exists('aimless.log'):
-							os.rename('aimless.log','aimless_%s_%i.log' %(dname,frame2))
-	print("spotfind parameters:", minspot, sigb, sigs)
-	os.chdir(dir_output)
-	print("completed data set:", dirfile)
-	
-### optimize minispot, sigmab and sigmas for dials spotfinding 
-def dOptimize(frame,dmin,spg, minspot, sigb, sigs):
-	grid_list=[[]]
-	for minspot in range(2,6,2):
-		for sigb in range(2,5,2):
-			for sigs in range(2,5,2): 
-				#print minspot, sigb, sigs
-				dFindspots2(frame,dmin,minspot,sigb,sigs)
-				dIndex(frame, spg)
-				dRefine()
-				if os.path.exists('dials.integrate.log'):
-					os.remove('dials.integrate.log')	
-				dIntegrate(dmin,frame)
-				if os.path.exists('dials.integrate.log'):
-					iovers=subprocess.Popen("cat dials.integrate.log |awk '/i\/sigi \(profile fitting/ {print $5}'", shell=True, stdout=subprocess.PIPE).stdout.read().strip()
-					#iovers=random.uniform(0, 1)
-					#print("grid search: ", minspot, sigb, sigs, iovers)				
-					grid_ldatablock.json
-	grid_list.append([iovers, minspot, sigb, sigs])
-	grid_list2 = filter(None, grid_list)
-	if os.path.exists('grid_list'):
-                os.remove('grid_list')
-	op1=open('grid_list','w')
-	op1.write(''.join(str(x) for x in grid_list2))
-	return max(grid_list2, key=lambda x: x[0])
+def save(path, value):
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(value, indent=2))
+    temp.replace(path)
 
-############################################
+
+def write_report(out, best, alternatives, records, identity='unknown'):
+    lines = ['# PyMDA processing results', '',
+             'Processed %s rotation datasets with current DIALS and CCP4.' % len(records), '',
+             '| Selection | Resolution (A) | I/sigma overall | I/sigma outer | CC-half outer | Completeness overall / outer (%) | Datasets |',
+             '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
+    for label, result in [('Highest supported resolution', best)] + list(alternatives.items()):
+        s = result['statistics']
+        lines.append('| %s | %.2f | %.1f | %.1f | %.3f | %.1f / %.1f | %s |' % (label, s['resolution'][0], s['isigi'][0], s['isigi'][2], s['cc_half'][2], s['completeness'][0], s['completeness'][2], len(result['crystals'])))
+    lines += ['', 'Final amplitudes and CCP4 Free-R flags: `best/final.mtz`.',
+              'Merged intensities and anomalous columns: `best/scaled.mtz`.',
+              'Thresholds: `%s`.' % json.dumps(best['thresholds'], sort_keys=True), '',
+              'Chosen input scans and last included frame:', '']
+    lines += ['- `%s`: frame %s' % pair for pair in zip(best['crystals'], best['last_frames'])]
+    identity_note = {'unknown': 'Crystal identity is unverified. This output establishes a multi-dataset merge and does not establish that the inputs are independent crystals.', 'repeat': 'The inputs were identified as repeat scans of one crystal. This output is a multi-dataset merge.', 'independent': 'The inputs were identified as independent crystals by the supplied collection information.'}[identity]
+    labels = {Path(r['config']['master']).parent.name for r in records}
+    if identity == 'unknown' and len(labels) == 1:
+        identity_note += ' All input paths use the same immediate folder label: `%s`.' % next(iter(labels))
+    lines += ['', 'The search compares cumulative prefixes chosen by I/sigma, prefixes chosen by CC-half, and full scans, across all multi-dataset subsets and the recorded cutoff grid. It does not exhaust all possible frame combinations or reproduce the paper\'s SmRmerge rejection procedure.', '', identity_note, '',
+              'See `trials.csv`, `trials.json`, `resolution_tradeoff.png`, and individual tool logs for the full comparison. CCP4 Free-R value 0 identifies the approximately 5% test set; other values identify working subsets.']
+    (out/'processing_report.md').write_text('\n'.join(lines)+'\n')
+
+
+def scale(tools, mtzs, directory, resolution):
+    directory.mkdir(parents=True, exist_ok=True)
+    summary = directory / 'statistics.json'
+    inputs = {'mtzs': [str(x.resolve()) for x in mtzs], 'resolution': resolution}
+    newest_input = max(p.stat().st_mtime_ns for p in mtzs)
+    if summary.is_file() and summary.stat().st_mtime_ns >= newest_input and (directory / 'scaled.mtz').is_file() and (directory / 'inputs.json').is_file() and json.loads((directory / 'inputs.json').read_text()) == inputs:
+        return json.loads(summary.read_text())
+    if summary.exists():
+        summary.unlink()
+    save(directory / 'inputs.json', inputs)
+    commands = '\n'.join('HKLIN "%s"' % x.resolve() for x in mtzs)
+    # Let Pointless check symmetry and align indexing; do not blindly COPY.
+    reusable = None
+    for sibling in sorted(directory.parent.glob('resolution_*')):
+        metadata = sibling / 'inputs.json'
+        if sibling != directory and metadata.is_file() and (sibling/'sorted.mtz').is_file() and (sibling/'statistics.json').is_file() and (sibling/'statistics.json').stat().st_mtime_ns >= newest_input and json.loads(metadata.read_text())['mtzs'] == inputs['mtzs']:
+            reusable = sibling
+            break
+    if reusable:
+        for name in ['sorted.mtz', 'pointless.console.log', 'pointless.command.json']:
+            shutil.copy2(reusable/name, directory/name)
+        save(directory/'pointless_reused.json', {'source': str(reusable)})
+    else:
+        tools.run('pointless', ['hklout', 'sorted.mtz'], directory,
+                  commands + '\nALLOW OUTOFSEQUENCEFILES\nEND\n', ['sorted.mtz'])
+    log = tools.run('aimless', ['hklin', 'sorted.mtz', 'hklout', 'scaled.mtz'], directory,
+                   'BINS 20\nRESOLUTION HIGH %.4f\nANOMALOUS ON\nEND\n' % resolution, ['scaled.mtz'])
+    stats = aimless_stats(log)
+    save(summary, stats)
+    return stats
+
+
+def process(tools, master, out, args):
+    directory = out / 'crystals' / dataset_id(master)
+    manifest = directory / 'manifest.json'
+    config = {'master': str(master), 'frames': args.frames, 'wedges': args.wedges, 'resolution': args.reso, 'space_group': args.spg, 'unit_cell': args.unit_cell, 'fix_detector': args.fix_detector}
+    if manifest.is_file():
+        old = json.loads(manifest.read_text())
+        if old['config'] != config:
+            raise ValueError('Processing settings changed; use a new output directory: %s' % directory)
+        if all(Path(p['mtz']).is_file() for p in old['prefixes']):
+            for prefix in old['prefixes']:
+                mtz = Path(prefix['mtz'])
+                prefix['statistics'] = scale(tools, [mtz], mtz.parent/'assessment', args.reso_cchalf)
+            old['selected'] = max(old['prefixes'], key=lambda x: (x['statistics']['cc_half'][0] >= 0.3, x['statistics']['isigi'][0], x['statistics']['cc_half'][0]))
+            save(manifest, old)
+            return old
+    directory.mkdir(parents=True, exist_ok=True)
+    config_file = directory / 'processing_config.json'
+    had_config = config_file.is_file()
+    if had_config and json.loads(config_file.read_text()) != config:
+        raise ValueError('Processing settings changed; use a new output directory: %s' % directory)
+    save(config_file, config)
+    # A completed integration can be recovered after an export/scaling failure.
+    # Verify its command, source import and completion log before adopting it.
+    integration_command = directory / 'dials.integrate.command.json'
+    import_command = directory / 'dials.import.command.json'
+    integrated_log = directory / 'dials.integrate.console.log'
+    recover = all((directory / f).is_file() for f in ['integrated.expt', 'integrated.refl', 'imported.expt']) and integration_command.is_file() and import_command.is_file() and integrated_log.is_file()
+    if recover:
+        argv = json.loads(integration_command.read_text())['argv']
+        imported_argv = json.loads(import_command.read_text())['argv']
+        recover = (str(master) in imported_argv and 'prediction.d_min=%s' % args.reso in argv
+                   and 'Saving the experiments to integrated.expt' in integrated_log.read_text()
+                   and args.frames is None
+                   and (had_config or (args.spg is None and args.unit_cell is None and not args.fix_detector)))
+    if args.exports_only and not recover:
+        raise ValueError('Cannot safely recover this integration; run normal processing: %s' % directory)
+    if not recover:
+        tools.run('dials.import', [master], directory, expected=['imported.expt'])
+    exp = json.loads((directory / 'imported.expt').read_text())
+    start, end = exp['scan'][0]['image_range']
+    if args.frames:
+        end = min(end, start + args.frames - 1)
+    if not recover:
+        tools.run('dials.find_spots', ['imported.expt', 'scan_range=%s,%s' % (start, end), 'filter.d_min=%s' % args.reso, 'nproc=%s' % args.thread], directory, expected=['strong.refl'])
+    index_args = ['imported.expt', 'strong.refl']
+    if args.spg:
+        index_args.append('space_group=%s' % args.spg)
+    if args.unit_cell:
+        index_args.append('unit_cell=%s' % args.unit_cell)
+    if args.fix_detector:
+        index_args.append('detector.fix=all')
+    if not recover:
+        tools.run('dials.index', index_args, directory, expected=['indexed.expt', 'indexed.refl'])
+        refine_args = ['indexed.expt', 'indexed.refl']
+        if args.fix_detector:
+            refine_args.append('detector.fix=all')
+        tools.run('dials.refine', refine_args, directory, expected=['refined.expt', 'refined.refl'])
+        tools.run('dials.integrate', ['refined.expt', 'refined.refl', 'prediction.d_min=%s' % args.reso, 'scan_range=%s,%s' % (start, end), 'nproc=%s' % args.thread], directory, expected=['integrated.expt', 'integrated.refl'])
+    # DIALS may trim scan endpoints lacking reflections during refinement.
+    integrated = json.loads((directory / 'integrated.expt').read_text())
+    actual_start, actual_end = integrated['scan'][0]['image_range']
+    start, end = max(start, actual_start), min(end, actual_end)
+    prefixes = []
+    for last in sorted(set(start - 1 + ((end-start+1)*i + args.wedges-1)//args.wedges for i in range(1, args.wedges+1))):
+        wedge = directory / ('prefix_%04d' % last)
+        tools.run('dials.slice_sequence', [directory / 'integrated.expt', directory / 'integrated.refl', 'image_range=%s,%s' % (start,last), 'output.experiments=sliced.expt', 'output.reflections=sliced.refl'], wedge, expected=['sliced.expt', 'sliced.refl'])
+        tools.run('dials.export', ['sliced.expt', 'sliced.refl', 'mtz.hklout=integrated.mtz'], wedge, expected=['integrated.mtz'])
+        try:
+            stats = scale(tools, [wedge / 'integrated.mtz'], wedge / 'assessment', args.reso_cchalf)
+            prefixes.append({'last_frame': last, 'mtz': str((wedge/'integrated.mtz').resolve()), 'statistics': stats})
+        except (RuntimeError, ValueError) as e:
+            save(wedge / 'failure.json', {'error': str(e)})
+    if not prefixes:
+        raise RuntimeError('No prefix scaled successfully: %s' % master)
+    # At a common cutoff, choose strongest supported signal, allowing partial completeness.
+    best = max(prefixes, key=lambda x: (x['statistics']['cc_half'][0] >= 0.3, x['statistics']['isigi'][0], x['statistics']['cc_half'][0]))
+    value = {'config': config, 'prefixes': prefixes, 'selected': best}
+    save(manifest, value)
+    return value
+
+
+def assemble(tools, records, out, args):
+    if len(records) < 2:
+        raise ValueError('Multi-crystal assembly requires at least two successful crystals')
+    if len(records) > 10:
+        raise ValueError('Exhaustive subset search limited to 10 crystals; supply a smaller input collection')
+    results = []
+    policies = ['selected', 'cchalf', 'full'] if args.prefix_policy == 'all' else ['selected', 'full'] if args.prefix_policy == 'both' else [args.prefix_policy]
+    evaluated = {}
+    def evaluate_subset(policy, indices):
+        rows = []
+        if policy == 'selected':
+            prefixes = [records[i]['selected'] for i in indices]
+        elif policy == 'cchalf':
+            prefixes = [max(records[i]['prefixes'], key=lambda p: (p['statistics']['cc_half'][0], p['statistics']['cc_half'][2], p['statistics']['isigi'][0])) for i in indices]
+        else:
+            prefixes = [max(records[i]['prefixes'], key=lambda p: p['last_frame']) for i in indices]
+        mtzs = [Path(p['mtz']) for p in prefixes]
+        for resolution in sorted(set(args.resolutions)):
+            if resolution < args.reso:
+                continue
+            directory = out / 'trials' / policy / ('crystals_' + '_'.join(str(i+1) for i in indices)) / ('resolution_%.2f' % resolution)
+            try:
+                key = (tuple(map(str, mtzs)), resolution)
+                if key in evaluated:
+                    stats, directory = evaluated[key]
+                else:
+                    stats = scale(tools, mtzs, directory, resolution)
+                    evaluated[key] = (stats, directory)
+                rows.append({'crystals': [records[i]['config']['master'] for i in indices], 'prefix_policy': policy, 'last_frames': [p['last_frame'] for p in prefixes], 'requested_resolution': resolution, 'directory': str(directory), 'statistics': stats, 'eligible': admissible(stats, args.min_completeness, args.min_cc_half, args.min_isigi, args.min_outer_completeness)})
+            except (RuntimeError, ValueError) as e:
+                save(directory / 'failure.json', {'error': str(e)})
+        return rows
+
+    # Subsets are independent; keep resolution trials within each subset serial
+    # so the Pointless output can be reused safely. Policies form separate waves.
+    merge_workers = getattr(args, 'merge_workers', None) or args.thread
+    with ThreadPoolExecutor(max_workers=min(merge_workers, 4)) as executor:
+        for policy in policies:
+            futures = [executor.submit(evaluate_subset, policy, indices)
+                       for size in range(2, len(records)+1)
+                       for indices in itertools.combinations(range(len(records)), size)]
+            for future in as_completed(futures):
+                results.extend(future.result())
+                save(out/'trials.json', results)
+    results.sort(key=lambda r: (policies.index(r['prefix_policy']), r['crystals'], r['requested_resolution']))
+    save(out / 'trials.json', results)
+    with (out/'trials.csv').open('w', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['prefix_policy', 'crystals', 'last_frames', 'requested_resolution_A', 'measured_resolution_A', 'isigi_overall', 'isigi_outer', 'cc_half_outer', 'completeness_overall', 'completeness_outer', 'eligible'])
+        for r in results:
+            s = r['statistics']
+            writer.writerow([r['prefix_policy'], ';'.join(r['crystals']), ';'.join(map(str,r['last_frames'])), r['requested_resolution'], s['resolution'][0], s['isigi'][0], s['isigi'][2], s['cc_half'][2], s['completeness'][0], s['completeness'][2], r['eligible']])
+    eligible = [x for x in results if x['eligible']]
+    if not eligible:
+        raise RuntimeError('No multi-crystal trial meets the stated quality thresholds; inspect trials.json')
+    best = min(eligible, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0], -x['statistics']['cc_half'][2]))
+    best['thresholds'] = {'completeness_overall': args.min_completeness, 'completeness_outer': args.min_outer_completeness, 'cc_half_outer': args.min_cc_half, 'isigi_outer': args.min_isigi}
+    alternatives = {'strongest_signal': max(eligible, key=lambda x: (x['statistics']['isigi'][0], -x['statistics']['resolution'][0]))}
+    extended = [x for x in results if x['statistics']['cc_half'][2] >= args.min_cc_half and x['statistics']['isigi'][2] >= args.min_isigi]
+    if extended:
+        alternatives['extended_resolution'] = min(extended, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0]))
+    pareto = []
+    strongest = float('-inf')
+    for candidate in sorted(eligible, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0])):
+        if candidate['statistics']['isigi'][0] > strongest:
+            pareto.append(candidate)
+            strongest = candidate['statistics']['isigi'][0]
+    save(out/'pareto.json', pareto)
+    for candidate in pareto:
+        target = out/'alternatives'/'pareto'/('resolution_%.2f' % candidate['statistics']['resolution'][0])
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(candidate['directory'])/'scaled.mtz', target/'scaled.mtz')
+        save(target/'selection.json', candidate)
+    complete = [x for x in eligible if x['statistics']['completeness'][0] >= 95]
+    if complete:
+        alternatives['completeness_95'] = min(complete, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0]))
+    for label, alternative in alternatives.items():
+        target = out/'alternatives'/label
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(alternative['directory'])/'scaled.mtz', target/'scaled.mtz')
+        save(target/'selection.json', alternative)
+    save(out/'alternatives.json', alternatives)
+    best['crystal_identity'] = getattr(args, 'crystal_identity', 'unknown')
+    write_report(out, best, alternatives, records, best['crystal_identity'])
+    final = out / 'best'
+    final.mkdir(exist_ok=True)
+    provenance = {'scaled_sha256': hashlib.sha256((Path(best['directory'])/'scaled.mtz').read_bytes()).hexdigest(), 'nres': args.nres, 'final_format': 'mean_and_anomalous_v1'}
+    previous = final/'final_inputs.json'
+    if previous.is_file() and json.loads(previous.read_text()) == provenance and (final/'final.mtz').is_file():
+        save(out/'best.json', best)
+        tools.run('ccp4-python', [Path(__file__).resolve().parent/'plot_results.py', out, out/'trials.json', out/'best.json'], out, expected=['resolution_tradeoff.png'])
+        print(json.dumps(best, indent=2), flush=True)
+        return
+    for name in ('scaled.mtz', 'sorted.mtz', 'aimless.console.log', 'pointless.console.log', 'statistics.json', 'inputs.json'):
+        shutil.copy2(Path(best['directory']) / name, final / name)
+    trunc_args = ['-mtzin', 'scaled.mtz', '-mtzout', 'amplitudes.mtz', '-colin', '/*/*/[IMEAN,SIGIMEAN]', '-colano', '/*/*/[I(+),SIGI(+),I(-),SIGI(-)]']
+    if args.nres:
+        trunc_args += ['-nres', args.nres]
+    tools.run('ctruncate', trunc_args, final, expected=['amplitudes.mtz'])
+    tools.run('freerflag', ['hklin', 'amplitudes.mtz', 'hklout', 'final.mtz'], final, 'FREERFRAC 0.05\nEND\n', ['final.mtz'])
+    save(previous, provenance)
+    save(out / 'best.json', best)
+    tools.run('ccp4-python', [Path(__file__).resolve().parent/'plot_results.py', out, out/'trials.json', out/'best.json'], out, expected=['resolution_tradeoff.png'])
+    print(json.dumps(best, indent=2), flush=True)
+
+
+def main():
+    args = options()
+    if args.thread < 1 or args.wedges < 1 or (args.frames is not None and args.frames < 1) or (args.merge_workers is not None and args.merge_workers < 1):
+        raise ValueError('Thread, wedge and frame counts must be positive')
+    masters = discover_masters(args.hdf5_path)
+    if args.master_files:
+        requested = {Path(p).expanduser().resolve() for p in args.master_files}
+        if not requested.issubset(set(masters)):
+            raise ValueError('Selected master files must be discovered below --hdf5_path')
+        masters = sorted(requested)
+    if args.discover:
+        print('\n'.join(map(str, masters)))
+        return
+    if not args.run_dials and not args.run_mda:
+        raise ValueError('Choose --run_dials and/or --run_mda, or --discover')
+    tools = Toolchain(args.ccp4)
+    out = Path(args.dir_output).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    source_dir = Path(__file__).resolve().parent
+    hashes = {name: hashlib.sha256((source_dir/name).read_bytes()).hexdigest() for name in ['pymda.py', 'autoDials.py', 'helpers.py', 'plot_results.py']}
+    save(out / 'run.json', {'started_utc': datetime.now(timezone.utc).isoformat(), 'options': vars(args), 'ccp4': str(tools.root), 'masters': list(map(str, masters)), 'source_sha256': hashes})
+    records = []
+    failures = []
+    if args.run_dials:
+        if not masters:
+            raise ValueError('No rotation master files found')
+        for master in masters:
+            if args.exports_only and not (out/'crystals'/dataset_id(master)/'integrated.expt').is_file():
+                continue
+            try:
+                records.append(process(tools, master, out, args))
+            except (RuntimeError, ValueError) as e:
+                print(str(e), file=sys.stderr, flush=True)
+                failures.append({'master': str(master), 'error': str(e)})
+                save(out / 'failures.json', failures)
+    else:
+        records = [json.loads(p.read_text()) for p in sorted((out/'crystals').glob('*/manifest.json'))]
+    if args.run_dials:
+        save(out/'failures.json', failures)
+    if args.run_mda:
+        assemble(tools, records, out, args)
+    elif not records:
+        raise RuntimeError('All crystals failed; see failures.json')
+
+
 if __name__ == '__main__':
-	options = setOptions()
-	hdf5_path = options.hdf5_path
-	dataprefix = options.dataprefix
-	dir_output = options.dir_output
-	frames = options.frames
-	reso = float(options.reso)
-	reso2 = float(options.reso2)
-	spg = options.spg
-	cc_cutoff = float(options.cccutoff)
-	dname = options.data
-	decay = options.decay.split()
-	picc =  options.picc
-	run_picc = options.run_picc
-	ucr = options.ucr
-	tolerance = options.tolerance
-	xtal_steps = options.xtal_steps
-	frame_steps = options.frame_steps
-	rjxtal = options.rjxtal
-	rjframe = options.rjframe
-	nres = options.nres
-	thread = options.thread
-	run_dials = options.run_dials
-	run_mda = options.run_mda
-	single = options.single
-### run dials to process hdf5 data  
-	if run_dials == True:
-		#where raw data is
-		os.chdir(dir_output)
-		ipt_list = []
-		for root, dirs, files in os.walk(hdf5_path):
-			for filename in files:
-				if filename.endswith('_master.h5') & ("_Raster_" not in filename):
-					#directories.append(root)
-					ipt_list.append(root+' '+filename[:-10])
-					#ipt_list.append([root,filename[:-10]])
-					if not os.path.exists(dir_output+'/'+filename[:-10]):
-						os.makedirs(dir_output+'/'+filename[:-10])
-		#print ipt_list
-
-		#print("ipt")
-		os.chdir(dir_output)
-		#sys.exit()
-		try:
-			p = Pool(thread)
-			p.map(f, ipt_list)
-		finally:
-			p.close()
-	#sys.exit()
-	
-
-#### run mda for microdiffraction data assembly 
-	if run_mda == True:
-	
-########## prepare necessary files for assembly ###########################
-
-		# return to the working directory 
-		os.chdir(dir_output)
-		
-		cc12sorted = helpers.createFs(dir_output, dataprefix, cc_cutoff)
-		#print("cc1/2 sorted: ", cc12sorted)
-		#count number of entries in list cc12sorted
-		n_data = len(cc12sorted)
-
-		#put average unit cell of each folder into unit_cell.txt
-		#unit_cell.txt2 contains only numbers, excluding 90 or 120 in unit_cell.txt
-		if n_data > 1:
-			helpers.createAUC1(dir_output,dataprefix, cc_cutoff)
-		else:
-			helpers.createAUC2(dir_output)
-		
-		if ucr > 1: 
-			clslist = uc_rejection.ucr(dir_output+"/unit_cell.txt2", ucr, dir_output,single)
-		else: 
-			clslist = uc_rejection.single(n_data, ucr, dir_output)
-		#sys.exit()
-
-	###### assemble data with a resolution cutoff
-		r = str(reso)
-		for clr in range(1,ucr+1):
-			#leave this function in local variables to be used in the dials.dialsPointless function below
-			if os.path.exists(dir_output + "/include.txt"):
-				os.remove(dir_output + "/include.txt")
-			include = open(dir_output+"/include.txt", "a")
-			trackFold = []
-			trackFiles = []
-			clustnum = []
-			for x in range(len(clslist)):
-				if clslist[x][0] == clr:
-					include.write(str(clslist[x][1]) + '\n')
-					trackFold.append(cc12sorted[x][0])
-					trackFiles.append(cc12sorted[x][1][0])
-					#print("cccc:", clslist[x][1], cc12sorted[x][0], cc12sorted[x][1][0])
-			include.close()
-			autoDials.dPointless2(trackFiles, trackFold, tolerance, dir_output) #run on all files
-			autoDials.dAimless20(r)
-			autoDials.dProcesses(nres, dir_output)
-
-			#Rename files for back up
-			rename = dname+'_'+str(clr)+'_'+str(len(trackFold))+'_all_'+ r
-			if os.path.exists(dir_output + '/scala_unique.mtz'):
-				shutil.copy2(dir_output + '/scala_unique.mtz', rename +'_scala_unique.mtz')
-			if os.path.exists(dir_output + '/aimless.log'):
-				shutil.copy2(dir_output + '/aimless.log', rename +'_aimless.log')
-			if os.path.exists(dir_output + '/scala.sca'):
-				shutil.copy2(dir_output + '/scala.sca', rename + '_scala.sca')
-			if os.path.exists(dir_output + '/tmp2.txt'):
-				shutil.copy2(dir_output + '/tmp2.txt', rename + '_included.txt')
-			if os.path.exists(dir_output + '/pointless.log'):
-				shutil.copy2(dir_output + '/pointless.log', rename +'_pointless.log')
-			if os.path.exists(dir_output + '/sorted.mtz'):
-				shutil.copy2(dir_output + '/sorted.mtz', rename +'_sorted.mtz')
-			print("finished with process of clsuter #", clr)
-			
-			#call picc_rejection and ask  for the number of classes
-			if run_picc == True:
-				helpers.createPicc(dir_output)
-				picc_rejection.pr(dir_output + '/1-picc.txt', picc, dir_output)
-				t_class = input("How many classes to be split, followed by [ENTER]: ")
-				picc_rejection.pr(dir_output+'/1-picc.txt', int(t_class), dir_output)
-				n_cluster = input("Input class number followed by [ENTER]: ")
-				if int(n_cluster)>int(t_class):
-					print("Cluster number is too big, exit")
-
-				#leave this function in - local variables to be used in the dials.dialsPointless function below
-				if os.path.exists(dir_output + "/include.txt"):
-					os.remove(dir_output + "/include.txt")
-
-				include = open(dir_output+"/include.txt", "a")
-				with open(dir_output + "/cluster.txt") as f:
-					content = f.readlines()
-					trackFiles = []
-					trackFold = []
-					for b in content:
-						bl = b.find("b")
-						space = b.find(" ")
-						filenumber = int(b[bl+2:])
-						if b[bl+1:space] == str(n_cluster):
-							print b[space+1:]
-							trackFold.append(cc12sorted[filenumber-1][0])
-							trackFiles.append(cc12sorted[filenumber-1][1][0])
-							include.write(b[space+1:])
-					include.close()
-		
-				autoDials.dPointless2(trackFiles, trackFold, tolerance, dir_output)
-				autoDials.dAimless20(r)
-				autoDials.dProcesses(nres, dir_output)
-
-				#aimless.log, sorted.mtz, pointless.log are used for xtal rejection, tmp2.txt to be used to generate tmp3.txt for further rejection
-				rename = dname+'_'+str(clr)+'_'+str(n_cluster)+'_picc_'+str(len(trackFold))+'_'+ r
-				if os.path.exists(dir_output+'/scala_unique.mtz'):
-					shutil.copy2(dir_output+'/scala_unique.mtz', rename +'_scala_unique.mtz')
-				if os.path.exists(dir_output+'/aimless.log',):
-					shutil.copy2(dir_output+'/aimless.log', rename+'_aimless.log')
-				if os.path.exists(dir_output+'/scala.sca'):
-					shutil.copy2(dir_output+'/scala.sca', rename+'_scala.sca')
-				if os.path.exists(dir_output +'/tmp2.txt'):
-					shutil.copy2(dir_output +'/tmp2.txt', rename+'_included.txt')
-				print("finished with PICC rejection")
-
-			##### XTAL REJECTION #####
-			if rjxtal == True:
-				first_time = True
-				a=0
-				while a==0:
-					check = [dir_output+"/extra.txt", dir_output+"/batch.txt", dir_output+"/SmRmerge.txt", dir_output+"/tmp3.txt"]
-					for files in check:
-						if os.path.exists(files):
-							os.remove(files)
-
-					helpers.createExtra(dir_output)
-					helpers.createSmr(dir_output)
-					helpers.createBatch(dir_output)
-
-					shutil.copyfile(dir_output+"/tmp2.txt", dir_output+"/tmp3.txt")
-					#data = sum(1 for line in open('/home/lina/uxtal/combine/tmp3.txt'))
-					helpers.createTmp3a(dir_output)
-					Tmp3b = helpers.createTmp3b(dir_output)
-					total = len(Tmp3b)
-					
-					#if not the first iteration, subtract xtal_steps and run rejection processes
-					if first_time == False:
-						#helpers.createSmrTmp4(path, xtal_steps, dir_output)
-						if os.path.exists(dir_output+"/tmp4.txt"):
-							os.remove(dir_output+"/tmp4.txt")
-
-						#smr = open(dir_output + "/smr_included.txt", "a")
-						tmp4 = open(dir_output+"/tmp4.txt", "a")
-
-						trackFiles = []
-						trackFold = []
-						#total = total - xtal_steps
-						Tmp3b = Tmp3b[:total-xtal_steps]
-						for x in range(len(Tmp3b)):
-							#smr.write(Tmp3b[x][0] + '\n')
-							num = int(Tmp3b[x][0]) - 1 ### list starts from zero 
-							#print("tt2:",x, num, cc12sorted[num][0], cc12sorted[num][1][0])
-							trackFold.append(cc12sorted[num][0])
-							trackFiles.append(cc12sorted[num][1][0])
-							tmp4.write('HKLIN ' + str(cc12sorted[num][0])+ "/integrated_" + str(cc12sorted[num][0]) + "_" + str(cc12sorted[num][1][0]) + ".mtz" + "\n")
-						#smr.close()
-						tmp4.close()
-						autoDials.dPointless2(trackFiles, trackFold, tolerance, dir_output)
-						autoDials.dAimless20(r)
-						autoDials.dProcesses(nres, dir_output)
-						try:
-							n_cluster
-						except NameError:
-							n_cluster = None
-						if run_picc == True:
-							rename = dname+'_'+str(clr)+ '_' + str(n_cluster)+'_'+str(len(trackFold))+'_' + r
-						else:
-							rename = dname+'_'+str(clr)+ '_' +str(len(trackFold))+'_' + r
-						if os.path.exists(dir_output+'/tmp4.txt'):
-							shutil.copy2(dir_output+'/tmp4.txt', rename+'_included.txt')
-						if os.path.exists(dir_output+'/scala_unique.mtz'):
-							shutil.copy2(dir_output+'/scala_unique.mtz', rename+'_scala_unique.mtz')
-						if os.path.exists(dir_output+'/scala.sca'):
-							shutil.copy2(dir_output+'/scala.sca', rename + '_scala.sca')
-						if os.path.exists(dir_output+'/aimless.log'):
-							shutil.copy2(dir_output+'/aimless.log', rename+'_aimless.log') #aimless.log to be used for next round of SmRmerge calculation
-						if os.path.exists(dir_output+'/tmp3_smr.txt'):
-							shutil.copy2(dir_output+'/tmp3_smr.txt', rename+'_smr.txt')
-						if os.path.exists(dir_output+'/sorted.mtz'):
-							shutil.copy2(dir_output+'/sorted.mtz', rename+'_sorted.mtz') #sorted.mtz to be used for frame rejection
-						if os.path.exists(dir_output+'/tmp4.txt'):
-							shutil.copy2(dir_output+'/tmp4.txt', 'tmp2.txt') #tmp2.txt to be used to produce tmp3.txt for iterative xtal rejection
-
-					else: ## if this is the first time run, add everything to the file and loop back to while
-						if os.path.exists(dir_output+"/tmp4.txt"):
-							os.remove(dir_output+"/tmp4.txt")
-						tmp4 = open(dir_output+"/tmp4.txt", "a")
-						trackFiles = []
-						trackFold = []
-						#total = len(Tmp3b)
-						#Tmp3b = Tmp3b[:total-xtal_steps]
-						#print("Tmp3b", Tmp3b, len(Tmp3b))
-						for x in range(len(Tmp3b)):
-							#smr.write(Tmp3b[x][0] + '\n')
-							num = int(Tmp3b[x][0]) - 1  ## list starts from zero 
-							#print("tt:",x, num, cc12sorted[num][0], cc12sorted[num][1][0])
-							trackFold.append(cc12sorted[num][0])
-							trackFiles.append(cc12sorted[num][1][0])
-							tmp4.write('HKLIN ' + str(cc12sorted[num][0])+ "/integrated_" + str(cc12sorted[num][0]) + "_" + str(cc12sorted[num][1][0]) + ".mtz" + "\n")
-						tmp4.close()
-						first_time = False 
-
-					##### FRAME REJECTION #####
-					if rjframe == True:
-						os.chdir(dir_output)
-						#print("rjframe", rjframe) 
-						if rjxtal == True :
-							check = [dir_output + "/SmRmerge.txt",  dir_output + "/batch.txt", dir_output + "/extra.txt"]
-							for files in check:
-								if os.path.exists(files):
-									os.remove(files)
-							helpers.createExtra(dir_output)
-							helpers.createSmr(dir_output)
-							helpers.createBatch(dir_output)
-
-						data = sum(1 for line in open(dir_output+'/tmp2.txt'))
-						#print("rjframe", rjframe) 
-						#for d in arange(decay, 0.1, -0.5):
-						for d in list(decay):
-							check = [dir_output+"/tmpa.txt", dir_output+"/smax.txt", dir_output+"/inc.txt"]
-							for files in check:
-								if os.path.exists(files):
-									os.remove(files)
-									#print(files, "is removed.")
-
-							with open(dir_output+"/batch.txt") as bt:
-								ln = bt.readlines()
-
-								for batchSE in ln:
-									inc = open(dir_output+"/inc.txt", "a")
-									smaxfile = open(dir_output+"/smax.txt", "a")
-									inc.seek(0)
-									inc.truncate()
-									x = re.sub(' +', ' ', batchSE)
-									xnew = x.split(' ')
-
-									batch_start = int(xnew[1])
-									batch_end = int(xnew[2])
-									#print(".....", batch_start, batch_end)
-									with open(dir_output+"/SmRmerge.txt") as smr:
-										ln2 = smr.readlines()
-										values = []
-										### find minimum smr for each data
-										for y in ln2:
-											y = re.sub(' +', ' ', y)
-											ynew = y.split(' ')
-											cut = int(ynew[2])
-											sm = float(ynew[13])
-											if cut <= batch_end and cut >= batch_start:
-												values.append(sm) ### extract frames to get smr value 
-										#print("values", values)
-										smin = min(values) ### find minimum smr value
-										smax = smin*(1+float(d))  ### get percentage 
-										smaxfile.write(str(smin)+' '+str(smax)+'\n')
-										for z in ln2:
-											z = re.sub(' +', ' ', z)
-											znew = z.split(' ')
-											cut = int(znew[2])
-											if cut <= batch_end and cut >= batch_start:
-												val = float(znew[13])
-												if val<smax:
-													#inc = open(dir_output+"/inc.txt", "a")
-													inc.write(znew[2]+'\n')
-													#print("write out", znew[2])
-									inc.write(str(batch_start)+'\n')
-									inc.write(str(batch_end)+'\n')
-									inc.close()
-									smaxfile.close()
-									#sys.exit()
-									
-									tmpa = open(dir_output+"/tmpa.txt", "a")
-									with open(dir_output+"/inc.txt") as f:
-										ln = f.readlines()
-										sortThis = [line.strip() for line in ln]
-										sortThis = sorted(map(int, sortThis))
-						#				tmpa.seek(0)
-						#				tmpa.truncate()
-										#print("sortThis", sortThis)
-										for i in range(len(sortThis)-1):
-											if sortThis[i+1]-sortThis[i]>frame_steps:
-												#tmpa.write("test")
-												tmpa.write("exclude batch " + str(sortThis[i]+1) + " to " + str(sortThis[i+1]-1)+'\n')
-										sortThis = map(str, sortThis)
-										x = '\n'.join(sortThis)
-									tmpa.close()
-
-											
-							autoDials.dAimless2(r, dir_output)
-							autoDials.dProcesses(nres, dir_output)
-
-							if run_picc == True:
-								rename = dname+'_'+str(clr) + '_' + str(n_cluster)+'_'+str(len(trackFold))+'_'+str(d)+'_'+r
-							else:
-								rename = dname+'_'+str(clr) + '_' + str(len(trackFold))+'_'+str(d)+'_'+ r 
-				
-							if os.path.exists(dir_output+'/tmpa.txt'):
-								shutil.copy2(dir_output+'/tmpa.txt', rename + '_tmpa.log')
-							if os.path.exists(dir_output+'/smax.txt'):
-								shutil.copy2(dir_output+'/smax.txt', rename + '_smax.log')
-							if os.path.exists(dir_output+'/aimless2.log'):
-								shutil.copy2(dir_output+'/aimless2.log', rename + '_aimless.log')
-							if os.path.exists(dir_output+'/scala.sca'):
-								shutil.copy2(dir_output+'/scala.sca', rename + '_scala.sca')
-							if os.path.exists(dir_output+'/scala_unique.mtz'):
-								shutil.copy2(dir_output+'/scala_unique.mtz', rename + '_scala_unique.mtz')
-
-					#reset the value of a based on steps and files
-					#print "total:", len(Tmp3b) 
-					if len(Tmp3b) > xtal_steps:
-						#total = total - xtal_steps
-						a=0
-					else:
-						a=1
-	## output sorted results
-	cmd = 'fgrep "DelAnom" *_%s_aimless.log |sort -k 6 -n |tee DelAnom_sorted.log' %(reso)
-	#subprocess.Popen(cmd,shell=True).wait()
-	cmd = 'fgrep "Mn(I) half" *_%s_aimless.log |sort -k 7 -n |tee CC12_sorted.log' %(reso)
-	#subprocess.Popen(cmd,shell=True).wait()
+    try:
+        main()
+    except (RuntimeError, ValueError) as error:
+        sys.exit(str(error))
