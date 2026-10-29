@@ -12,35 +12,24 @@ or a parent containing `ccp4-*`. No global PATH edits are needed.
 python3 pymda.py --discover
 python3 pymda.py --run_dials --run_mda --thread 2 --wedges 4
 ```
-
-For this test collection, the finer cutoff search used:
-
-```bash
 python3 pymda.py --run_dials --run_mda --thread 2 --wedges 4 \
   --merge_workers 4 \
-  --resolutions 2.0 2.2 2.22 2.24 2.25 2.26 2.27 2.28 2.3 2.4 2.5 3.0
+  --resolutions 2.0 2.2 2.3 2.4 2.5 3.0
 ```
 
 `--merge_workers` controls independent subset jobs, separately from DIALS
 image-processing workers. The search reuses completed stages and scaling trials.
 
 Defaults: tools under `/home/aa1/ccp47`, recursively discovered rotation master
-files under `~/.codex/pymda_data`, output under `~/.codex/pymda_output`.
+files under `~/pymda_data`, output under `~/pymda_output`.
 Broken links, duplicate master-file links and raster files are excluded. HDF5
-master files must retain accessible companion data files. Raw inputs are never
-modified. The controlling Python needs only the standard library; DIALS/CCP4
-supply their own scientific runtime.
+master files must retain accessible companion data files. 
 
-The pipeline imports, finds spots, indexes without imposing a space group,
-refines and integrates each scan to 1.8 A. `--spg` and `--unit_cell` accept known
-symmetry/cell constraints. Each crystal is exported at cumulative frame prefixes
+The pipeline imports, finds spots, indexes refines and integrates. `--spg` and `--unit_cell` accept known symmetry/cell constraints. Each crystal is exported at cumulative frame prefixes
 (`--wedges 4`: 25%, 50%, 75%, 100%) without reintegrating the images. Prefixes
 are assessed with Pointless/Aimless at a common cutoff (`--reso_cchalf 2.5`);
 the prefix with strongest overall merged I/sigma(I), provided its overall
 CC-half is at least 0.3 when possible, is selected for subset comparisons.
-This is a modern search inspired by PyMDA, rather than a literal implementation
-of the paper's SmRmerge frame-rejection procedure. The legacy interactive
-rejection flags have been replaced by an automatic, auditable search.
 
 All subsets of two or more crystals are scaled across `--resolutions`
 using I/sigma-selected prefixes, CC-half-selected prefixes (as in the paper),
@@ -83,7 +72,7 @@ python3 pymda.py --run_mda --resolutions 2.0 2.1 2.2 2.3 2.5
 ```
 
 Use a new output directory when changing integration/prefix settings. `--frames`
-can limit a pilot run; it changes the scientific sampling and must be documented.
+can limit a pilot run; it changes the scientific sampling.
 Individual crystal/trial failures are logged; a run exits unsuccessfully if no
 supported multi-crystal result exists. Exhaustive subset comparisons are limited
 to ten crystals. Standalone `uc_rejection.ucr` and `picc_rejection.pr` clustering
@@ -94,9 +83,15 @@ python3 -m unittest -v test_pymda
 ```
 
 ## Local web application
+python3 -m venv ~/.pymda
+source ~/.pymda/bin/activate
 
-Run `.pymda/bin/python run_web.py` and open http://127.0.0.1:8000.
-The FastAPI interface uses Python-generated pages with no Jinja2 or JavaScript,
+#install FastAPI using pip, preferably using an isolated environment.
+
+pip install "fastapi[standard]"
+
+Run `~/.pymda/bin/python run_web.py` and open http://127.0.0.1:8000.
+The FastAPI interface uses Python-generated pages 
 and provides dataset selection, queued processing/assembly, cancellation,
 recovery, logs, statistics, plots and downloads. No authentication is required;
 access is restricted to localhost. See [WEB.md](WEB.md) for configuration,
