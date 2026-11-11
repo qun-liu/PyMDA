@@ -17,6 +17,20 @@ def dataset_id(path):
     return path.name.removesuffix('_master.h5') + '_' + hashlib.sha256(str(path).encode()).hexdigest()[:8]
 
 
+def frame_wedges(first, last, count):
+    """Partition an inclusive scan range into consecutive, balanced wedges."""
+    frames = last - first + 1
+    if frames < 1 or count < 1 or count > frames:
+        raise ValueError('Consecutive wedge count must be between one and the number of scan frames')
+    width, remainder = divmod(frames, count)
+    ranges = []
+    for index in range(count):
+        end = first + width + (index < remainder) - 1
+        ranges.append((first, end))
+        first = end + 1
+    return ranges
+
+
 def aimless_stats(path):
     text = Path(path).read_text()
     labels = {'resolution': 'High resolution limit', 'isigi': 'Mean((I)/sd(I))', 'cc_half': 'Mn(I) half-set correlation CC(1/2)', 'completeness': 'Completeness', 'multiplicity': 'Multiplicity', 'rmeas': 'Rmeas (all I+ & I-)'}

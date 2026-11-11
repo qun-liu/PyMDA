@@ -42,7 +42,15 @@ This is a modern search inspired by PyMDA, rather than a literal implementation
 of the paper's SmRmerge frame-rejection procedure. The legacy interactive
 rejection flags have been replaced by an automatic, auditable search.
 
-All subsets of two or more crystals are scaled across `--resolutions`
+`--split_wedges 3` additionally divides a 1,800-frame scan into consecutive
+wedges 1-600, 601-1200 and 1201-1800. Each wedge receives its own intensity MTZ
+and Pointless/Aimless assessment. The default, 1, keeps the scan unsplit.
+If the frame count is not divisible by the wedge count, the extra frames go
+to the earliest wedges; no frame appears in two wedges. Boundaries use the
+original scan or pilot range, with DIALS-trimmed endpoints recorded separately.
+Completed integrations can be reused when changing this export setting.
+
+For collections of up to ten datasets, all subsets of two or more crystals are scaled across `--resolutions`
 using I/sigma-selected prefixes, CC-half-selected prefixes (as in the paper),
 and full-scan prefixes; identical trials are computed once. The cutoffs default to 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 3.0 A. Pointless checks symmetry
 and indexing compatibility, rather than copying an assumed indexing. Aimless
@@ -85,8 +93,16 @@ python3 pymda.py --run_mda --resolutions 2.0 2.1 2.2 2.3 2.5
 Use a new output directory when changing integration/prefix settings. `--frames`
 can limit a pilot run; it changes the scientific sampling and must be documented.
 Individual crystal/trial failures are logged; a run exits unsuccessfully if no
-supported multi-crystal result exists. Exhaustive subset comparisons are limited
-to ten crystals. Standalone `uc_rejection.ucr` and `picc_rejection.pr` clustering
+result meets the stated quality thresholds. `--subset_search auto` accepts one
+or many datasets: up to ten it compares all subsets; above ten it uses a bounded
+search with at most `--max_subsets 64` candidates per prefix policy. Candidates
+include the full collection, available compatibility groups, leave-one-out
+trials for up to sixteen individually weakest scans, and growing subsets ranked
+by individual signal with CC-half support. `search.json` records every candidate
+and the actual method. This bounded search does not explore every combination.
+Use `--subset_search bounded --max_subsets N` to change the budget, or
+`--subset_search exhaustive` for a collection of at most ten datasets.
+Standalone `uc_rejection.ucr` and `picc_rejection.pr` clustering
 utilities remain available; the CLI subset search does not depend on SciPy.
 
 ```bash
@@ -95,9 +111,26 @@ python3 -m unittest -v test_pymda
 
 ## Local web application
 
-Run `.pymda/bin/python run_web.py` and open http://127.0.0.1:8000.
+Run `python3 run_web.py` and open http://127.0.0.1:8000.
 The FastAPI interface uses Python-generated pages with no Jinja2 or JavaScript,
 and provides dataset selection, queued processing/assembly, cancellation,
 recovery, logs, statistics, plots and downloads. No authentication is required;
 access is restricted to localhost. See [WEB.md](WEB.md) for configuration,
 API routes and regression/real-data tests.
+
+Single datasets can now be finalized with `--run_dials --run_mda` and a single
+selected master file. To compare exported datasets, use `--compare` against
+an output directory containing crystal manifests; optional screening controls
+are `--cell_length_tolerance`, `--cell_angle_tolerance`, `--min_pair_cc`,
+and `--min_common`, with `--reso_cchalf` setting the common comparison cutoff.
+The web interface provides comparison, group selection and directory buttons;
+see [WEB.md](WEB.md).
+
+Use `--dataset_ids ID1 ID2` to restrict comparison or assembly to processed
+manifest directory IDs. `selection.json` records included and excluded IDs.
+
+The same workflow handles other rotation HDF5 collections using `--hdf5_path`
+and a collection-specific `--dir_output`. Rerun the same command to resume:
+completed imports, integrations, exports and successful scaling trials are
+reused, and failed stages are retried. `--exports_only` also supports completed
+pilot integrations, after verifying their original scan bounds and settings.

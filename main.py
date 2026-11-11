@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 import ipaddress
 import json
+import os
 from pathlib import Path
 import subprocess
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode, quote, unquote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -14,7 +15,7 @@ from pydantic import ValidationError
 
 from autoDials import Toolchain
 from helpers import discover_masters
-from web.jobs import ROOT, JobSpec, JobStore, Settings, contained, source_manifests, validate_spec
+from web.jobs import ROOT, JobSpec, JobStore, Settings, contained, local_directory, source_catalog, validate_spec
 from web import ui
 
 
@@ -120,15 +121,26 @@ def create_app(settings=None, start_worker=True, inspector=inspect_datasets):
                 data = inspector([Path(p) for p in spec.master_files],settings)
                 if not data or any(not d['ready'] for d in data):
                     raise ValueError('Selected master files have unreadable metadata or missing companion data')
+                for dataset in data:
+                    frames = dataset.get('frames')
+                    if frames and spec.split_wedges > min(frames, spec.frames or frames):
+                        raise ValueError('Consecutive wedge count exceeds the number of frames in %s' % dataset['name'])
         except (ValueError,OSError,KeyError,subprocess.SubprocessError) as error:
             raise HTTPException(422,str(error)) from error
         return store.create(spec)
 
     @app.get('/',response_class=HTMLResponse)
-    def home(input_dir: str='', source_dir: str=''):
-        input_dir = input_dir or str(settings.input_root)
-        source_dir = source_dir or str(settings.output_root)
+    def home(request: Request, input_dir: str='', source_dir: str='', output_dir: str='', group: int=0):
+        input_dir = input_dir or os.getenv('PYMDA_START_INPUT_DIR',str(settings.input_root))
         data, sources, errors = [], [], []
+        default_output = settings.output_root if settings.output_root.is_dir() else settings.jobs_root
+        output_dir = output_dir or unquote(request.cookies.get('pymda_output_dir', '')) or str(default_output)
+        try:
+            output_dir = str(local_directory(output_dir, writable=True))
+        except (ValueError,OSError) as error:
+            errors.append(str(error))
+            output_dir = str(default_output)
+        source_dir = source_dir or unquote(request.cookies.get('pymda_source_dir', '')) or os.getenv('PYMDA_START_SOURCE_DIR',output_dir)
         try:
             directory = contained(input_dir,[settings.input_root])
             if not directory.is_dir():
@@ -137,18 +149,89 @@ def create_app(settings=None, start_worker=True, inspector=inspect_datasets):
         except (ValueError,OSError,subprocess.SubprocessError) as error:
             errors.append(str(error))
         try:
-            source = contained(source_dir,[settings.output_root,settings.jobs_root])
-            for path in source_manifests(source):
-                record = json.loads(path.read_text())
-                sources.append({'id':path.parent.name,'name':Path(record['config']['master']).name,'frame':record['selected']['last_frame']})
+            source = local_directory(source_dir)
+            sources = source_catalog(source)
         except (ValueError,OSError,KeyError) as error:
             errors.append(str(error))
-        return ui.home(settings,store.list(),input_dir,data,source_dir,sources,'; '.join(errors))
+        comparison = ui.load_json(Path(source_dir)/'comparison.json', {}) if sources else {}
+        selected = comparison.get('groups', [])[group-1] if 0 < group <= len(comparison.get('groups', [])) else None
+        response = HTMLResponse(ui.home(settings,store.list(),input_dir,data,source_dir,sources,'; '.join(errors),output_dir,comparison,selected))
+        response.set_cookie('pymda_output_dir', quote(output_dir, safe='/'), max_age=30*86400, httponly=True, samesite='strict')
+        if Path(source_dir).is_dir():
+            response.set_cookie('pymda_source_dir', quote(str(Path(source_dir).resolve()), safe='/'), max_age=30*86400, httponly=True, samesite='strict')
+        return response
+
+    @app.get('/api/processed-datasets')
+    def processed_datasets(source_dir: str=''):
+        try:
+            source = local_directory(source_dir or settings.output_root)
+            return [{key:value for key,value in entry.items() if key not in {'manifest','record'}} for entry in source_catalog(source)]
+        except (ValueError,OSError) as error:
+            raise HTTPException(422,str(error)) from error
+
+    @app.get('/browse', response_class=HTMLResponse)
+    def browse(request: Request, kind: str='input_dir', path: str='', input_dir: str='', source_dir: str='', output_dir: str=''):
+        roots = [settings.input_root] if kind == 'input_dir' else [Path('/')]
+        if kind not in {'input_dir','source_dir','output_dir'}:
+            raise HTTPException(422,'Invalid directory type')
+        try:
+            defaults = {'input_dir': input_dir or str(settings.input_root),
+                        'source_dir': source_dir or str(settings.output_root),
+                        'output_dir': output_dir or unquote(request.cookies.get('pymda_output_dir', '')) or str(settings.output_root)}
+            directory = local_directory(contained(path or defaults[kind], roots))
+            state = dict(kind=kind,input_dir=input_dir,source_dir=source_dir,output_dir=output_dir)
+            def link(target, label):
+                return '<p><a class="button secondary" href="/browse?'+ui.e(urlencode(dict(state,path=str(target))))+'">'+ui.e(label)+'</a></p>'
+            title = {'input_dir':'Choose data directory','source_dir':'Choose processed-data directory','output_dir':'Choose output directory'}[kind]
+            hidden = ''.join('<input type="hidden" name="'+key+'" value="'+ui.e(value)+'">' for key,value in state.items())
+            body = '<h1>'+title+'</h1><form method="get" action="/browse">'+hidden+'<label for="browse_path">Folder path</label><input id="browse_path" name="path" value="'+ui.e(directory)+'"><div class="actions"><button class="secondary">Open directory</button></div></form>'
+            for target,label in ([(settings.input_root,'Input root')] if kind == 'input_dir' else [(Path.home(),'Home folder'),(Path('/'),'Filesystem root')]):
+                if target != directory:
+                    body += link(target,label)
+            try:
+                contained(directory.parent,roots)
+                if directory.parent != directory:
+                    body += link(directory.parent,'Parent directory')
+            except ValueError:
+                pass
+            for child in sorted(directory.iterdir()):
+                try:
+                    if child.is_dir():
+                        contained(child,roots)
+                        body += link(child,child.name)
+                except (ValueError,OSError):
+                    pass
+            values = dict(input_dir=input_dir,source_dir=source_dir,output_dir=output_dir)
+            values[kind] = str(directory)
+            writable = os.access(directory,os.W_OK | os.X_OK)
+            if kind != 'output_dir' or writable:
+                body += '<a class="button" href="/?'+ui.e(urlencode(values))+'">Use this directory</a>'
+            else:
+                body += '<p class="notice">This directory is not writable. Open a writable folder to select an output location.</p>'
+            if kind == 'output_dir' and writable:
+                body += '<form method="post" action="/directories">'+''.join('<input type="hidden" name="'+key+'" value="'+ui.e(value)+'">' for key,value in values.items())+'<input type="hidden" name="path" value="'+ui.e(directory)+'"><label>New folder name</label><input name="name" required><button>Create folder</button></form>'
+            return ui.page('Choose directory',body)
+        except (ValueError,OSError) as error:
+            raise HTTPException(422,str(error)) from error
+
+    @app.post('/directories')
+    async def create_directory(request: Request):
+        form = await request.form()
+        try:
+            parent = local_directory(form['path'],writable=True)
+            name = form['name']
+            if not name or Path(name).name != name or name in {'.','..'}:
+                raise ValueError('Enter a single folder name')
+            target = parent/name
+            target.mkdir()
+            return RedirectResponse('/browse?'+urlencode(dict(kind='output_dir',path=str(target),input_dir=form.get('input_dir',''),source_dir=form.get('source_dir',''),output_dir=form.get('output_dir',''))),status_code=303)
+        except (ValueError,OSError) as error:
+            raise HTTPException(422,str(error)) from error
 
     @app.get('/api/datasets')
     def datasets(input_dir: str=''):
         try:
-            directory = contained(input_dir or settings.input_root,[settings.input_root])
+            directory = contained(input_dir or os.getenv('PYMDA_START_INPUT_DIR',str(settings.input_root)),[settings.input_root])
             return inspector(discover_masters(directory),settings)
         except (ValueError,OSError,subprocess.SubprocessError) as error:
             raise HTTPException(422,str(error)) from error
@@ -182,15 +265,18 @@ def create_app(settings=None, start_worker=True, inspector=inspect_datasets):
             values['resolutions'] = values['resolutions'].replace(',',' ').split()
         values['fix_detector'] = values.get('fix_detector') == 'true'
         try:
-            if values.get('mode') == 'assemble' and not values['dataset_ids']:
-                raise ValueError('Select at least two processed datasets')
+            if values.get('mode') in {'assemble','compare'} and not values['dataset_ids']:
+                raise ValueError('Select at least one processed dataset')
             spec = JobSpec(**values)
             # Metadata and filesystem operations run off the ASGI event loop.
             job = await asyncio.to_thread(submit,spec)
         except (ValueError,ValidationError,HTTPException) as error:
             message = error.detail if isinstance(error,HTTPException) else str(error)
             return HTMLResponse(ui.page('Check parameters','<div class="card"><h1>Check the submitted parameters</h1><p>'+ui.e(message)+'</p><a href="/">Return to the workspace</a></div>'),status_code=422)
-        return RedirectResponse('/jobs/'+job['id'],status_code=303)
+        response = RedirectResponse('/jobs/'+job['id'],status_code=303)
+        if job['params'].get('output_dir'):
+            response.set_cookie('pymda_output_dir', quote(job['params']['output_dir'], safe='/'), max_age=30*86400, httponly=True, samesite='strict')
+        return response
 
     @app.get('/jobs/{identifier}',response_class=HTMLResponse)
     def job_page(identifier: str, refresh: str='1', log_file: str='job.stdout.log'):
