@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -53,8 +54,22 @@ def contained(path, roots):
     return path
 
 
+def local_directory(path, writable=False):
+    directory = Path(path).expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError('Directory does not exist: %s' % directory)
+    if writable and not os.access(directory, os.W_OK | os.X_OK):
+        raise ValueError('Output directory is not writable: %s' % directory)
+    return directory
+
+
 class JobSpec(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    cell_length_tolerance: float = Field(default=2, gt=0, allow_inf_nan=False)
+    cell_angle_tolerance: float = Field(default=2, gt=0, allow_inf_nan=False)
+    min_pair_cc: float = Field(default=0.9, ge=-1, le=1, allow_inf_nan=False)
+    min_common: int = Field(default=100, ge=3)
+    output_dir: str = ''
     mode: str = 'process'
     input_dir: str = ''
     master_files: list[str] = Field(default_factory=list)
@@ -63,6 +78,9 @@ class JobSpec(BaseModel):
     thread: int = Field(default=2, ge=1, le=2)
     merge_workers: int = Field(default=2, ge=1, le=4)
     wedges: int = Field(default=4, ge=1, le=20)
+    split_wedges: int = Field(default=1, ge=1, le=100)
+    subset_search: str = 'auto'
+    max_subsets: int = Field(default=64, ge=1, le=4096)
     frames: int | None = Field(default=None, ge=1)
     reso: float = Field(default=1.8, gt=0, allow_inf_nan=False)
     reso_cchalf: float = Field(default=2.5, gt=0, allow_inf_nan=False)
@@ -81,15 +99,16 @@ class JobSpec(BaseModel):
     @field_validator('mode')
     @classmethod
     def mode_valid(cls, value):
-        if value not in {'process', 'assemble', 'both'}:
-            raise ValueError('Choose process, assemble or both')
+        if value not in {'process', 'assemble', 'both', 'compare'}:
+            raise ValueError('Choose process, compare, assemble or both')
         return value
 
-    @field_validator('prefix_policy', 'crystal_identity')
+    @field_validator('prefix_policy', 'crystal_identity', 'subset_search')
     @classmethod
     def choice_valid(cls, value, info):
         choices = {'prefix_policy': {'all', 'both', 'selected', 'cchalf', 'full'},
-                   'crystal_identity': {'unknown', 'repeat', 'independent'}}
+                   'crystal_identity': {'unknown', 'repeat', 'independent'},
+                   'subset_search': {'auto', 'exhaustive', 'bounded'}}
         if value not in choices[info.field_name]:
             raise ValueError('Invalid selection')
         return value
@@ -128,12 +147,98 @@ class JobSpec(BaseModel):
 
 
 def source_manifests(source):
-    return sorted(Path(source).glob('crystals/*/manifest.json'))
+    """Find direct results and results nested under job/output directories."""
+    root = Path(source).resolve()
+    if root.name == 'crystals':
+        return sorted(root.glob('*/manifest.json'))
+    for directory in (root, *root.parents):
+        if directory.parent.name == 'crystals':
+            manifest = directory/'manifest.json'
+            return [manifest] if manifest.is_file() else []
+    return sorted(root.glob('**/crystals/*/manifest.json'))
+
+
+def source_manifest_map(source):
+    root = Path(source).resolve()
+    manifests = {}
+    for path in source_manifests(root):
+        identifier = path.parent.name
+        result_root = path.parent.parent.parent
+        if result_root != root and result_root not in root.parents:
+            relative = path.relative_to(root)
+            identifier = identifier[:120] + '__' + hashlib.sha256(relative.as_posix().encode()).hexdigest()[:16]
+        manifests[identifier] = path
+    return manifests
+
+
+def source_mtz(manifest, reference):
+    """Resolve an export inside its crystal directory, including moved results."""
+    crystal = Path(manifest).parent
+    requested = Path(reference).expanduser()
+    candidates = [requested] if requested.is_absolute() else [crystal/requested, crystal.parent.parent/requested]
+    for index, part in enumerate(requested.parts[:-1]):
+        if part == 'crystals' and requested.parts[index+1] == crystal.name:
+            candidates.append(crystal.joinpath(*requested.parts[index+2:]))
+    for candidate in candidates:
+        try:
+            path = contained(candidate, [crystal])
+            if path.is_file() and path.stat().st_size:
+                return path
+        except (ValueError,OSError):
+            pass
+    raise ValueError('Missing exported MTZ in %s: %s' % (crystal, requested.name))
+
+
+def source_catalog(source):
+    entries, preferred = [], {}
+    for identifier, path in source_manifest_map(source).items():
+        entry = {'id': identifier, 'dataset_id': path.parent.name, 'manifest': path,
+                 'source_dir': str(path.parent.parent.parent), 'name': path.parent.name,
+                 'frame': None, 'integration_resolution': None, 'ready': False,
+                 'default_selected': False, 'error': '', 'record': None}
+        try:
+            record = json.loads(path.read_text())
+            entry['name'] = Path(record['config']['master']).name
+            resolution = float(record['config']['resolution'])
+            if not math.isfinite(resolution) or resolution <= 0 or not record['prefixes']:
+                raise ValueError('Incomplete processing manifest')
+            entry['integration_resolution'] = resolution
+            exports = set()
+            for prefix in record['prefixes'] + [record['selected']]:
+                if not isinstance(prefix['last_frame'], int) or prefix['last_frame'] <= 0:
+                    raise ValueError('Invalid last frame in processing result')
+                for key in ('resolution','isigi','cc_half','completeness'):
+                    values = prefix['statistics'][key]
+                    if not isinstance(values, list) or len(values) < 3 or not all(math.isfinite(float(v)) for v in values):
+                        raise ValueError('Incomplete prefix statistics')
+            entry['frame'] = record['selected']['last_frame']
+            for prefix in record['prefixes']:
+                exports.add(source_mtz(path, prefix['mtz']))
+            if source_mtz(path, record['selected']['mtz']) not in exports:
+                raise ValueError('Selected MTZ is not one of the processed exports')
+            for wedge in record.get('scan_wedges', []):
+                if wedge.get('mtz'):
+                    source_mtz(path, wedge['mtz'])
+            score = (record['config'].get('frames') is None,
+                     max(p['last_frame'] for p in record['prefixes']),
+                     -resolution, path.stat().st_mtime_ns)
+            entry.update(ready=True, record=record)
+            master = record['config']['master']
+            if master not in preferred or score > preferred[master][0]:
+                preferred[master] = (score, entry)
+        except (ValueError,OSError,KeyError,TypeError) as error:
+            entry['error'] = 'Incomplete or unavailable processing result: %s' % error
+        entries.append(entry)
+    for score, entry in preferred.values():
+        entry['default_selected'] = True
+    return entries
 
 
 def validate_spec(spec, settings):
     spec = spec.model_copy(deep=True)
     if spec.mode in {'process', 'both'}:
+        if spec.frames is not None and spec.split_wedges > spec.frames:
+            raise ValueError('Consecutive wedge count cannot exceed the pilot frame limit')
         directory = contained(spec.input_dir or settings.input_root, [settings.input_root])
         if not directory.is_dir():
             raise ValueError('Input directory does not exist')
@@ -143,32 +248,33 @@ def validate_spec(spec, settings):
             raise ValueError('Select existing rotation master files from the input directory')
         spec.master_files = list(map(str, sorted(set(selected))))
         spec.input_dir = str(directory)
-        if spec.mode == 'both' and len(selected) < 2:
-            raise ValueError('Assembly requires at least two datasets; choose process for a single scan')
-        if spec.mode == 'both' and len(selected) > 10:
-            raise ValueError('Select at most ten datasets for the exhaustive assembly search')
+        if spec.mode == 'both' and spec.subset_search == 'exhaustive' and len(spec.master_files) > 10:
+            raise ValueError('Use auto or bounded search for more than ten datasets')
     else:
-        source = contained(spec.source_dir or settings.output_root, [settings.output_root, settings.jobs_root])
-        manifests = {p.parent.name: p for p in source_manifests(source)}
-        ids = sorted(set(spec.dataset_ids or manifests))
-        if len(ids) < 2 or len(ids) > 10 or not set(ids).issubset(manifests):
-            raise ValueError('Select between two and ten processed datasets from the source directory')
+        source = local_directory(spec.source_dir or settings.output_root)
+        entries = {entry['id']: entry for entry in source_catalog(source)}
+        ids = sorted(set(spec.dataset_ids or [key for key,entry in entries.items() if entry['default_selected']]))
+        if not ids or not set(ids).issubset(entries):
+            raise ValueError('Select one or more processed datasets from the source directory')
+        if spec.mode == 'assemble' and spec.subset_search == 'exhaustive' and len(ids) > 10:
+            raise ValueError('Use auto or bounded search for more than ten datasets')
         floor = 0.0
         for identifier in ids:
-            record = json.loads(manifests[identifier].read_text())
+            entry = entries[identifier]
+            if not entry['ready']:
+                raise ValueError(entry['error'])
+            record = entry['record']
             floor = max(floor, float(record['config']['resolution']))
-            for prefix in record['prefixes']:
-                path = contained(prefix['mtz'], [source])
-                if not path.is_file() or path.stat().st_size == 0:
-                    raise ValueError('A source MTZ is missing: %s' % path.name)
         spec.reso = floor
         spec.source_dir = str(source)
         spec.dataset_ids = ids
         spec.input_dir = str(settings.input_root)
-    if spec.mode != 'process' and any(r < spec.reso for r in spec.resolutions):
+    if spec.mode in {'assemble','both'} and any(r < spec.reso for r in spec.resolutions):
         raise ValueError('Merging cutoffs cannot exceed the integrated resolution (smaller Angstrom values)')
     if spec.reso_cchalf < spec.reso:
         raise ValueError('Prefix assessment cutoff must be at least the integration cutoff')
+    if spec.output_dir:
+        spec.output_dir = str(local_directory(spec.output_dir, writable=True))
     return spec
 
 
@@ -201,7 +307,7 @@ class JobStore:
             return None
         record = dict(row)
         record['params'] = json.loads(record['params'])
-        record['output_dir'] = str(self.settings.jobs_root / record['id'] / 'output')
+        record['output_dir'] = str(Path(record['params']['output_dir']) / record['id'] / 'output') if record['params'].get('output_dir') else str(self.settings.jobs_root / record['id'] / 'output')
         return record
 
     def get(self, identifier):
@@ -266,20 +372,30 @@ def prepare_assembly(job, spec):
     source = Path(spec.source_dir)
     output = Path(job['output_dir'])
     output.mkdir(parents=True, exist_ok=True)
+    comparison = source/'comparison.json'
+    if comparison.is_file():
+        shutil.copy2(comparison, output/'comparison.json')
+    manifests = source_manifest_map(source)
+    (output/'selection.json').write_text(json.dumps({'included':spec.dataset_ids,
+        'excluded':[key for key in manifests if key not in spec.dataset_ids], 'source':str(source),
+        'source_manifests':{key:str(manifests[key]) for key in spec.dataset_ids}},indent=2))
     for identifier in spec.dataset_ids:
-        original = source / 'crystals' / identifier / 'manifest.json'
+        original = manifests[identifier]
         record = json.loads(original.read_text())
+        selected = source_mtz(original, record['selected']['mtz'])
         mappings = {}
-        for prefix in record['prefixes']:
-            old = contained(prefix['mtz'], [source])
-            target = output / old.relative_to(source)
+        for prefix in record['prefixes'] + [w for w in record.get('scan_wedges', []) if w.get('mtz')]:
+            old = source_mtz(original, prefix['mtz'])
+            target = output/'crystals'/identifier/old.relative_to(original.parent.resolve())
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_suffix('.copying')
             shutil.copy2(old, temporary)
             temporary.replace(target)
             mappings[str(old)] = str(target)
             prefix['mtz'] = str(target)
-        record['selected']['mtz'] = mappings[str(Path(record['selected']['mtz']).resolve())]
+        record['selected']['mtz'] = mappings[str(selected)]
+        record['dataset_id'] = identifier
+        record['source_manifest'] = str(original)
         target_manifest = output / 'crystals' / identifier / 'manifest.json'
         temporary = target_manifest.with_suffix('.tmp')
         temporary.write_text(json.dumps(record, indent=2))
@@ -291,13 +407,16 @@ def command_for(spec, output, settings):
                '--hdf5_path', spec.input_dir, '--dir_output', str(output),
                '--thread', str(spec.thread), '--merge_workers', str(spec.merge_workers),
                '--wedges', str(spec.wedges), '--reso', str(spec.reso),
+               '--subset_search', spec.subset_search, '--max_subsets', str(spec.max_subsets),
                '--reso_cchalf', str(spec.reso_cchalf), '--prefix_policy', spec.prefix_policy,
                '--min_completeness', str(spec.min_completeness),
                '--min_outer_completeness', str(spec.min_outer_completeness),
                '--min_cc_half', str(spec.min_cc_half), '--min_isigi', str(spec.min_isigi),
                '--crystal_identity', spec.crystal_identity, '--resolutions', *map(str, spec.resolutions)]
     if spec.mode in {'process', 'both'}:
-        command += ['--run_dials', '--master_files', *spec.master_files]
+        command += ['--split_wedges', str(spec.split_wedges), '--run_dials', '--master_files', *spec.master_files]
+    if spec.mode == 'compare':
+        command += ['--compare', '--cell_length_tolerance', str(spec.cell_length_tolerance), '--cell_angle_tolerance', str(spec.cell_angle_tolerance), '--min_pair_cc', str(spec.min_pair_cc), '--min_common', str(spec.min_common)]
     if spec.mode in {'assemble', 'both'}:
         command += ['--run_mda']
     for field in ('frames', 'spg', 'unit_cell', 'nres'):

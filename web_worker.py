@@ -68,8 +68,8 @@ def stage_from_log(path):
             text = stream.read().decode(errors='replace')
         names = {'dials.import': 'Importing images', 'dials.find_spots': 'Finding diffraction spots',
                  'dials.index': 'Indexing', 'dials.refine': 'Refining geometry',
-                 'dials.integrate': 'Integrating reflections', 'dials.slice_sequence': 'Exporting frame prefixes',
-                 'dials.export': 'Exporting frame prefixes', 'pointless': 'Checking and combining data',
+                 'dials.integrate': 'Integrating reflections', 'dials.slice_sequence': 'Exporting scan ranges',
+                 'dials.export': 'Exporting scan ranges', 'pointless': 'Checking and combining data',
                  'aimless': 'Scaling and comparing merges', 'ctruncate': 'Converting intensities to amplitudes',
                  'freerflag': 'Assigning Free-R flags', 'ccp4-python': 'Plotting results'}
         for line in reversed(text.splitlines()):
@@ -88,7 +88,7 @@ def run_job(store, job):
     log = output / 'job.stdout.log'
     try:
         spec = validate_spec(JobSpec(**job['params']), store.settings)
-        if spec.mode == 'assemble':
+        if spec.mode in {'assemble', 'compare'}:
             prepare_assembly(job, spec)
         if STOP or store.get(job['id'])['cancel_requested']:
             status = 'interrupted' if STOP else 'cancelled'
@@ -122,14 +122,16 @@ def run_job(store, job):
             status, message = 'cancelled', 'Completed stages are retained for recovery.'
         elif process.returncode:
             status, message = 'failed', 'PyMDA exited with code %s. See the log for details.' % process.returncode
-        elif spec.mode != 'process' and not (output / 'best/final.mtz').is_file():
+        elif spec.mode in {'assemble', 'both'} and not (output / 'best/final.mtz').is_file():
             status, message = 'failed', 'The pipeline did not produce a final MTZ.'
         elif spec.mode == 'process' and not any(output.glob('crystals/*/manifest.json')):
             status, message = 'failed', 'The pipeline did not produce processed dataset manifests.'
+        elif spec.mode == 'compare' and not (output/'comparison.json').is_file():
+            status, message = 'failed', 'Comparison output is missing.'
         else:
             failures = read_json(output / 'failures.json', [])
             status = 'partial' if failures else 'succeeded'
-            message = '%s dataset(s) failed; inspect the log and resume to retry.' % len(failures) if failures else 'Completed successfully.'
+            message = '%s processing failure(s); inspect the log and resume to retry.' % len(failures) if failures else 'Completed successfully.'
         store.update(job['id'], status=status, message=message, finished=now(), pid=None, stage=status.title())
     except Exception as error:
         if process is not None:
