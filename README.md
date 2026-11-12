@@ -5,8 +5,9 @@ Original method: Takemaru et al., J. Appl. Cryst. (2020),
 https://doi.org/10.1107/S160057671901673X.
 
 This version uses Python 3 and current DIALS `.expt`/`.refl` files. It sources
-CCP4's `bin/ccp4.setup-sh` automatically; `--ccp4` accepts either an installation
-or a parent containing `ccp4-*`. No global PATH edits are needed.
+CCP4's `bin/ccp4.setup-sh` automatically. The default installation is found with
+`which aimless`; override it with `--ccp4` or `PYMDA_CCP4`. `--ccp4` accepts an
+installation, its `bin` directory, or a parent containing `ccp4-*`.
 
 ```bash
 python3 pymda.py --discover
@@ -24,7 +25,7 @@ python3 pymda.py --run_dials --run_mda --thread 2 --wedges 4 \
 `--merge_workers` controls independent subset jobs, separately from DIALS
 image-processing workers. The search reuses completed stages and scaling trials.
 
-Defaults: tools under `/home/aa1/ccp47`, recursively discovered rotation master
+Defaults: tools from the CCP4 installation found by `which aimless`, recursively discovered rotation master
 files under `~/.codex/pymda_data`, output under `~/.codex/pymda_output`.
 Broken links, duplicate master-file links and raster files are excluded. HDF5
 master files must retain accessible companion data files. Raw inputs are never

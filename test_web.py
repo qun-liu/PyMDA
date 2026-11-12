@@ -3,12 +3,14 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import tempfile
 import time
 import unittest
 import re
 from html import unescape
 from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -17,6 +19,13 @@ from web.jobs import JobSpec, JobStore, Settings, command_for, prepare_assembly,
 from web_worker import run_job
 
 BASE_URL = 'http://127.0.0.1:8000'
+
+
+def fake_ccp4(root):
+    programs=root/'bin'; programs.mkdir(parents=True)
+    (programs/'ccp4.setup-sh').write_text('#!/bin/sh\n')
+    aimless=programs/'aimless'; aimless.write_text('#!/bin/sh\nexit 0\n'); aimless.chmod(0o755)
+    return root
 
 
 def inspector(paths, settings):
@@ -45,7 +54,7 @@ class WebTests(unittest.TestCase):
         self.master = self.data/'deep'/'sample_master.h5'
         self.master.parent.mkdir(); self.master.touch()
         self.output = root/'processed'; self.output.mkdir()
-        self.settings = Settings(self.data,self.output,root/'jobs',testing=True)
+        self.settings = Settings(self.data,self.output,root/'jobs',ccp4=fake_ccp4(root/'default ccp4'),testing=True)
         self.client_context = TestClient(create_app(self.settings,start_worker=False,inspector=inspector),base_url=BASE_URL)
         self.client = self.client_context.__enter__()
 
@@ -75,6 +84,98 @@ class WebTests(unittest.TestCase):
         self.assertIn('Assemble processed datasets',response.text)
         self.assertNotIn('<script',response.text.lower())
         self.assertEqual(self.client.get('/docs').status_code,404)
+
+    def test_ccp4_default_is_detected_from_aimless_on_path(self):
+        detected=fake_ccp4(self.output.parent/'detected ccp4')
+        result=subprocess.CompletedProcess(['which','aimless'],0,str(detected/'bin/aimless')+'\n','')
+        with patch.dict(os.environ,{'PYMDA_CCP4':''}),patch('autoDials.subprocess.run',return_value=result) as which:
+            settings=Settings(self.data,self.output,self.settings.jobs_root,testing=True)
+            self.assertEqual(settings.ccp4,detected)
+            with TestClient(create_app(settings,start_worker=False,inspector=inspector),base_url=BASE_URL) as client:
+                page=client.get('/')
+                self.assertIn(f'id="ccp4" name="ccp4" type="text" value="{detected}"',page.text)
+                self.assertIn('Choose CCP4 directory',page.text)
+                self.assertIn('Detect from PATH',page.text)
+                self.assertNotIn('notice error',page.text)
+            which.assert_called_once_with(['which','aimless'],capture_output=True,text=True,timeout=5)
+
+    def test_select_ccp4_directory_controls_discovery_jobs_and_remembered_location(self):
+        chosen=fake_ccp4(self.output.parent/'another CCP4')
+        inspected=[]
+        def record(paths,settings):
+            inspected.append(settings.ccp4)
+            return inspector(paths,settings)
+        with TestClient(create_app(self.settings,start_worker=False,inspector=record),base_url=BASE_URL) as client:
+            response=client.get('/browse',params={'kind':'ccp4','path':str(chosen/'bin'),
+                'input_dir':str(self.data),'source_dir':str(self.output),'output_dir':str(self.output)})
+            self.assertEqual(response.status_code,200,response.text)
+            selected=unescape(re.search(r'href="([^"]+)">Use this directory</a>',response.text).group(1))
+            self.assertEqual(parse_qs(urlsplit(selected).query)['ccp4'],[str(chosen)])
+            page=client.get(selected)
+            self.assertEqual(page.status_code,200,page.text)
+            self.assertEqual(inspected[-1],chosen)
+            self.assertIn(f'id="ccp4" name="ccp4" type="text" value="{chosen}"',page.text)
+            self.assertEqual(page.text.count(f'type="hidden" name="ccp4" value="{chosen}"'),4)
+            output_link=unescape(re.search(r'href="([^"]+)">Choose output directory</a>',page.text).group(1))
+            self.assertEqual(parse_qs(urlsplit(output_link).query)['ccp4'],[str(chosen)])
+            response=client.get('/api/datasets',params={'input_dir':str(self.data),'ccp4':str(chosen/'bin')})
+            self.assertEqual(response.status_code,200,response.text)
+            self.assertEqual(inspected[-1],chosen)
+            response=client.post('/jobs',data={'mode':'process','input_dir':str(self.data),
+                'master_files':str(self.master),'output_dir':str(self.output),'ccp4':str(chosen/'bin')},follow_redirects=False)
+            self.assertEqual(response.status_code,303,response.text)
+            self.assertEqual(inspected[-1],chosen)
+            job=client.get('/api/jobs/'+response.headers['location'].split('/')[-1]).json()
+            self.assertEqual(job['params']['ccp4'],str(chosen))
+            args=command_for(JobSpec(**job['params']),Path(job['output_dir']),self.settings)
+            self.assertEqual(args[args.index('--ccp4')+1],str(chosen))
+            self.assertIn(f'value="{chosen}"',client.get('/').text)
+            client.get('/',params={'ccp4':str(self.settings.ccp4)})
+            self.assertEqual(client.get('/api/jobs/'+job['id']).json()['params']['ccp4'],str(chosen))
+            self.assertNotEqual(self.settings.ccp4,chosen)
+
+    def test_detect_from_path_replaces_saved_ccp4_selection(self):
+        detected=fake_ccp4(self.output.parent/'detected ccp4')
+        self.client.get('/')
+        result=subprocess.CompletedProcess(['which','aimless'],0,str(detected/'bin/aimless')+'\n','')
+        with patch('autoDials.subprocess.run',return_value=result):
+            page=self.client.get('/',params={'detect_ccp4':'true','ccp4':str(self.settings.ccp4)})
+        self.assertNotIn('notice error',page.text)
+        self.assertIn(f'id="ccp4" name="ccp4" type="text" value="{detected}"',page.text)
+        self.assertIn(f'value="{detected}"',self.client.get('/').text)
+
+    def test_invalid_ccp4_is_rejected_before_output_creation_and_saved_choice_falls_back(self):
+        destination=self.output.parent/'unused output'
+        response=self.client.post('/api/jobs',json=self.payload(ccp4=str(self.data),output_dir=str(destination)))
+        self.assertEqual(response.status_code,422,response.text)
+        self.assertIn('No CCP4 setup script',response.text)
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.client.get('/api/datasets',params={'ccp4':str(self.data)}).status_code,422)
+        page=self.client.get('/',params={'ccp4':str(self.data)})
+        self.assertIn('No CCP4 setup script',page.text)
+        page=self.client.get('/browse',params={'kind':'ccp4','path':str(self.data)})
+        self.assertNotIn('Use this directory',page.text)
+        self.assertIn('No CCP4 setup script',page.text)
+        self.client.cookies.set('pymda_ccp4',str(self.data),domain='127.0.0.1',path='/')
+        page=self.client.get('/')
+        self.assertNotIn('notice error',page.text)
+        self.assertIn(f'id="ccp4" name="ccp4" type="text" value="{self.settings.ccp4}"',page.text)
+
+    def test_app_and_worker_support_manual_ccp4_when_aimless_is_not_on_path(self):
+        pipeline=self.output.parent/'fake_pipeline.py'; pipeline.write_text(FAKE_PIPELINE)
+        settings=Settings(self.data,self.output,self.output.parent/'manual-ccp4-jobs',ccp4=None,pipeline=pipeline,testing=True)
+        with patch.dict(os.environ,{'PATH':'/usr/bin:/bin','PYMDA_CCP4':''}):
+            with TestClient(create_app(settings,inspector=inspector),base_url=BASE_URL) as client:
+                page=client.get('/')
+                self.assertIn('CCP4 was not found by which aimless',page.text)
+                self.assertIn('Choose CCP4 directory',page.text)
+                response=client.post('/api/jobs',json=self.payload())
+                self.assertEqual(response.status_code,422,response.text)
+                response=client.post('/api/jobs',json=self.payload(ccp4=str(self.settings.ccp4)))
+                self.assertEqual(response.status_code,201,response.text)
+                job=await_status(client,response.json()['id'],{'succeeded'})
+                self.assertEqual(job['params']['ccp4'],str(self.settings.ccp4))
+                self.assertTrue(client.get('/health').json()['worker_running'])
 
     def test_validation_and_unknown_fields(self):
         for extra in [{'thread':20},{'reso':float('inf')},{'resolutions':[-2]}, {'resolutions':[2.261]}, {'unit_cell':'1,2,3,10,10,160'}, {'command':'touch injected'}]:
@@ -268,7 +369,7 @@ class WebTests(unittest.TestCase):
 
     def test_missing_startup_locations_fall_back_for_workspace_browser_api_and_jobs(self):
         missing=self.output.parent/'removed defaults'
-        settings=Settings(self.data,missing,self.settings.jobs_root,testing=True)
+        settings=Settings(self.data,missing,self.settings.jobs_root,ccp4=self.settings.ccp4,testing=True)
         self.processed_result(settings.jobs_root/'previous job'/'output')
         with patch.dict(os.environ,{'PYMDA_START_INPUT_DIR':str(missing),'PYMDA_START_SOURCE_DIR':str(missing)}):
             with TestClient(create_app(settings,start_worker=False,inspector=inspector),base_url=BASE_URL) as client:
@@ -614,7 +715,7 @@ class WorkerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory();root=Path(self.temp.name)
         self.data=root/'data';self.data.mkdir();self.master=self.data/'sample_master.h5';self.master.touch()
         pipeline=root/'fake_pipeline.py';pipeline.write_text(FAKE_PIPELINE)
-        self.settings=Settings(self.data,root/'processed',root/'jobs',pipeline=pipeline,testing=True)
+        self.settings=Settings(self.data,root/'processed',root/'jobs',ccp4=fake_ccp4(root/'default ccp4'),pipeline=pipeline,testing=True)
         self.context=TestClient(create_app(self.settings,inspector=inspector),base_url=BASE_URL)
         self.client=self.context.__enter__()
 
@@ -635,7 +736,8 @@ class WorkerTests(unittest.TestCase):
         directory=self.data.parent/'external data'; directory.mkdir()
         master=directory/'external_master.h5'; master.touch()
         output=self.data.parent/'external results'/'new collection'
-        response=self.client.post('/api/jobs',json={'mode':'process','input_dir':str(directory),'master_files':[str(master)],'output_dir':str(output)})
+        chosen=fake_ccp4(self.data.parent/'chosen ccp4')
+        response=self.client.post('/api/jobs',json={'mode':'process','input_dir':str(directory),'master_files':[str(master)],'output_dir':str(output),'ccp4':str(chosen/'bin')})
         self.assertEqual(response.status_code,201,response.text)
         job=await_status(self.client,response.json()['id'],{'succeeded'})
         self.assertTrue(Path(job['output_dir']).is_relative_to(output))
@@ -643,6 +745,8 @@ class WorkerTests(unittest.TestCase):
         args=json.loads((Path(job['output_dir'])/'web_command.json').read_text())
         self.assertEqual(args[args.index('--hdf5_path')+1],str(directory))
         self.assertEqual(args[args.index('--master_files')+1],str(master))
+        self.assertEqual(args[args.index('--ccp4')+1],str(chosen))
+        self.assertEqual(job['params']['ccp4'],str(chosen))
 
     def child_for(self, job):
         path=Path(job['output_dir'])/'child.pid';deadline=time.monotonic()+15

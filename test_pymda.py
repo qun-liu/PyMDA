@@ -3,11 +3,67 @@ import tempfile
 import unittest
 import os
 import json
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 from helpers import discover_masters, dataset_id, frame_wedges, aimless_stats, admissible
-from autoDials import Toolchain
+from autoDials import Toolchain, ccp4_directory, default_ccp4, discover_ccp4
+
+
+class ToolchainLocationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.root=Path(self.temp.name)
+        self.ccp4=self.root/'programs with spaces'/'ccp4-9'
+        programs=self.ccp4/'bin'; programs.mkdir(parents=True)
+        (programs/'ccp4.setup-sh').write_text('#!/bin/sh\n')
+        self.aimless=programs/'aimless'; self.aimless.write_text('#!/bin/sh\n'); self.aimless.chmod(0o755)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_which_aimless_resolves_symlinked_executable_to_installation(self):
+        links=self.root/'path entries'; links.mkdir()
+        alias=links/'aimless'; alias.symlink_to(self.aimless)
+        result=subprocess.CompletedProcess(['which','aimless'],0,str(alias)+'\n','')
+        with patch('autoDials.subprocess.run',return_value=result) as which:
+            self.assertEqual(discover_ccp4(),self.ccp4)
+            which.assert_called_once_with(['which','aimless'],capture_output=True,text=True,timeout=5)
+
+    def test_environment_override_and_cli_default(self):
+        from pymda import options
+        with patch.dict(os.environ,{'PYMDA_CCP4':str(self.ccp4)}),patch('autoDials.subprocess.run') as which:
+            self.assertEqual(default_ccp4(),self.ccp4)
+            with patch('sys.argv',['pymda.py','--discover']):
+                self.assertEqual(options().ccp4,str(self.ccp4))
+            which.assert_not_called()
+        result=subprocess.CompletedProcess(['which','aimless'],0,str(self.aimless)+'\n','')
+        with patch.dict(os.environ,{'PYMDA_CCP4':''}),patch('autoDials.subprocess.run',return_value=result):
+            with patch('sys.argv',['pymda.py','--discover']):
+                self.assertEqual(options().ccp4,str(self.ccp4))
+            with patch('sys.argv',['pymda.py','--ccp4',str(self.root/'chosen')]):
+                self.assertEqual(options().ccp4,str(self.root/'chosen'))
+
+    def test_missing_aimless_or_which_keeps_discovery_and_help_usable(self):
+        from pymda import options
+        result=subprocess.CompletedProcess(['which','aimless'],1,'','')
+        with patch.dict(os.environ,{'PYMDA_CCP4':''}),patch('autoDials.subprocess.run',return_value=result):
+            self.assertIsNone(default_ccp4())
+            with patch('sys.argv',['pymda.py','--discover']):
+                self.assertIsNone(options().ccp4)
+        with patch('autoDials.subprocess.run',side_effect=FileNotFoundError('which')):
+            self.assertIsNone(discover_ccp4())
+
+    def test_accept_installation_parent_bin_and_aimless_and_reject_invalid_programs(self):
+        for path in [self.ccp4,self.ccp4.parent,self.ccp4/'bin',self.aimless]:
+            with self.subTest(path=path):
+                self.assertEqual(ccp4_directory(path),self.ccp4)
+        with self.assertRaisesRegex(ValueError,'No CCP4 setup script'):
+            ccp4_directory(self.root/'missing')
+        self.aimless.chmod(0o644)
+        with self.assertRaisesRegex(ValueError,'Missing executable Aimless'):
+            ccp4_directory(self.ccp4)
 
 
 class PipelineTests(unittest.TestCase):

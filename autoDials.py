@@ -6,14 +6,52 @@ import shlex
 import subprocess
 
 
+def ccp4_directory(path):
+    """Resolve an installation, its bin folder, or the Aimless executable."""
+    if not path:
+        raise ValueError('CCP4 was not found by which aimless. Choose a CCP4 installation directory or set PYMDA_CCP4.')
+    root = Path(path).expanduser().resolve()
+    if root.is_file() and root.name == 'aimless':
+        root = root.parent.parent
+    elif root.name == 'bin':
+        root = root.parent
+    if not (root/'bin/ccp4.setup-sh').is_file():
+        candidates = sorted(root.glob('ccp4-*/bin/ccp4.setup-sh'))
+        if not candidates:
+            raise ValueError('No CCP4 setup script below %s. Choose the folder containing bin/ccp4.setup-sh.' % root)
+        root = candidates[-1].parent.parent
+    if not os.access(root/'bin/ccp4.setup-sh', os.R_OK):
+        raise ValueError('CCP4 setup script is not readable: %s' % root)
+    if not os.access(root/'bin/aimless', os.X_OK):
+        raise ValueError('Missing executable Aimless in %s' % root)
+    return root
+
+
+def discover_ccp4():
+    """Find CCP4 through which aimless, including executable symlinks."""
+    try:
+        result = subprocess.run(['which', 'aimless'], capture_output=True, text=True, timeout=5)
+        if result.returncode or not result.stdout.strip():
+            return None
+        aimless = Path(result.stdout.strip().splitlines()[0]).expanduser()
+        for candidate in (aimless.parent.parent, aimless.resolve().parent.parent):
+            try:
+                return ccp4_directory(candidate)
+            except (ValueError, OSError):
+                pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def default_ccp4():
+    configured = os.getenv('PYMDA_CCP4')
+    return Path(configured).expanduser().resolve() if configured else discover_ccp4()
+
+
 class Toolchain:
-    def __init__(self, root):
-        root = Path(root).expanduser().resolve()
-        if not (root / 'bin/ccp4.setup-sh').is_file():
-            candidates = sorted(root.glob('ccp4-*/bin/ccp4.setup-sh'))
-            if not candidates:
-                raise ValueError('No CCP4 setup script below %s' % root)
-            root = candidates[-1].parent.parent
+    def __init__(self, root=None):
+        root = ccp4_directory(root or default_ccp4())
         self.root = root
         setup = root / 'bin/ccp4.setup-sh'
         result = subprocess.run(['bash', '-c', 'source "$1" >/dev/null && env -0', 'pymda', str(setup)], check=True, stdout=subprocess.PIPE)

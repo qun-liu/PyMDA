@@ -2,7 +2,7 @@
   "input_root": "/home/aa1",
   "output_root": "/home/aa1/.hermes/codex/test1",
   "jobs_root": "/home/aa1/.hermes/codex/PyMDA/web_state",
-  "ccp4": "/home/aa1/ccp47",
+  "ccp4": "/home/aa1/ccp47/ccp4-9",
   "pipeline": "/home/aa1/.hermes/codex/PyMDA/pymda.py",
   "python": "/home/aa1/anaconda3/bin/python3",
   "testing": false

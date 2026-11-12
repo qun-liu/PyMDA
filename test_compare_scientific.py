@@ -23,10 +23,10 @@ class ComparisonTests(unittest.TestCase):
                 target = directory/'integrated.mtz'
                 shutil.copy2(original,target)
                 (directory/'manifest.json').write_text(json.dumps({'config':{'master':name+'_master.h5'},'selected':{'mtz':str(target)}}))
-            r = compare(root,os.getenv('PYMDA_CCP4','/home/aa1/ccp47'),2.5,2,2,.99,100)
+            r = compare(root,os.getenv('PYMDA_CCP4'),2.5,2,2,.99,100)
             self.assertEqual(r['groups'],[['A','B','C']])
             self.assertTrue(all(p['correlation']>.99 and p['common_reflections']>=100 for p in r['pairs']))
-            r = compare(root,os.getenv('PYMDA_CCP4','/home/aa1/ccp47'),2.5,2,2,.99,10000000)
+            r = compare(root,os.getenv('PYMDA_CCP4'),2.5,2,2,.99,10000000)
             self.assertEqual(r['groups'],[['A'],['B'],['C']])
             self.assertTrue(all(p['correlation'] is None and 'Insufficient' in p['error'] for p in r['pairs']))
 

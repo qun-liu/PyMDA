@@ -154,7 +154,7 @@ def main():
     parser.add_argument('--config', required=True)
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
-    settings = Settings(**{k: Path(v) if k in {'input_root', 'output_root', 'jobs_root', 'ccp4', 'pipeline'} else v for k, v in config.items()})
+    settings = Settings(**{k: Path(v) if v is not None and k in {'input_root', 'output_root', 'jobs_root', 'ccp4', 'pipeline'} else v for k, v in config.items()})
     store = JobStore(settings)
     store.initialize()
     with (settings.jobs_root / 'worker.lock').open('a') as lock:

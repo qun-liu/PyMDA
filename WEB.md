@@ -51,7 +51,7 @@ Default paths:
 - Input: `~/.codex/pymda_data`
 - Existing results: `~/.codex/pymda_output`
 - Jobs and queue: `~/.codex/pymda_output/jobs`
-- Programs: `/home/aa1/ccp47`
+- Programs: CCP4 installation detected by `which aimless`
 
 Override them with `PYMDA_INPUT_ROOT`, `PYMDA_OUTPUT_ROOT`,
 `PYMDA_JOBS_ROOT`, and `PYMDA_CCP4` before starting. The process needs write
@@ -64,6 +64,20 @@ Deleted or inaccessible saved/default folders fall back to an accessible
 starting location. Explicitly selected input and processed-result folders must
 exist.
 Use `python run_web.py --port 8001` to change the port.
+
+The **CCP4 installation** section shows the default installation found by
+`which aimless` on the server's PATH. Enter another installation path and click
+**Apply CCP4 location**, or use **Choose CCP4 directory**. The installation
+folder, its `bin` folder, or a parent containing `ccp4-*` can be selected.
+**Detect from PATH** replaces a remembered choice with the current detected
+installation. If Aimless is absent from PATH, the app remains available so you
+can select CCP4 manually. `PYMDA_CCP4` overrides the startup default.
+
+The selected installation is used for raw-scan discovery and saved with each
+submitted processing, comparison or assembly job. Changing the web selection
+does not change queued jobs or their resume parameters. The browser remembers
+the selection alongside your input, processed-data and output folders.
+API clients can pass `ccp4` in job specifications and to `GET /api/datasets`.
 
 The API provides `GET /api/datasets`, `GET /api/processed-datasets?source_dir=...`, `GET/POST /api/jobs`,
 `GET /api/jobs/{id}`, and `POST /api/jobs/{id}/cancel` or `/resume`.
@@ -162,7 +176,7 @@ Scientific correlation regression checks run in the CCP4 runtime:
 
 ```bash
 PYMDA_TEST_MTZ=/absolute/path/to/exported/integrated.mtz \
-/home/aa1/ccp47/ccp4-9/bin/ccp4-python -m unittest -v test_compare_scientific
+ccp4-python -m unittest -v test_compare_scientific
 ```
 
 This verifies common-intensity correlation, three-dataset complete-link grouping,

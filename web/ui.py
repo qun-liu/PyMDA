@@ -90,13 +90,14 @@ def job_list(jobs):
     return '<table><thead><tr><th>Job</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>'
 
 
-def home(settings, jobs, input_dir, datasets, source_dir, sources, error='', output_dir='', comparison=None, selected=None):
+def home(settings, jobs, input_dir, datasets, source_dir, sources, error='', output_dir='', comparison=None, selected=None, ccp4=''):
     comparison = comparison or {}
+    hidden_ccp4 = '<input type="hidden" name="ccp4" value="'+e(ccp4)+'">'
     def browse(kind, label):
-        query = urlencode(dict(kind=kind,input_dir=input_dir,source_dir=source_dir,output_dir=output_dir,path={'input_dir':input_dir,'source_dir':source_dir,'output_dir':output_dir}[kind]))
+        query = urlencode(dict(kind=kind,input_dir=input_dir,source_dir=source_dir,output_dir=output_dir,ccp4=ccp4,path={'input_dir':input_dir,'source_dir':source_dir,'output_dir':output_dir,'ccp4':ccp4}[kind]))
         return '<a class="button secondary" href="/browse?'+e(query)+'">'+label+'</a>'
     def find_outputs():
-        query = urlencode(dict(input_dir=input_dir,source_dir=output_dir,output_dir=output_dir))
+        query = urlencode(dict(input_dir=input_dir,source_dir=output_dir,output_dir=output_dir,ccp4=ccp4))
         return '<a class="button secondary" href="/?'+e(query)+'#processed-datasets">Find processed datasets in this output folder</a>'
     def output_field(identifier):
         return field('output_dir','Output directory',output_dir,'text',attrs='required',identifier=identifier)+'<div class="actions">'+browse('output_dir','Choose output directory')+find_outputs()+'</div><small>Each job gets its own folder inside the selected directory. New output folders are created when a job is submitted.</small>'
@@ -113,18 +114,19 @@ def home(settings, jobs, input_dir, datasets, source_dir, sources, error='', out
         attributes = 'disabled' if not ready else 'checked' if checked else ''
         if ready and checked:
             selected_resolutions.append(item['integration_resolution'])
-        query = urlencode(dict(input_dir=input_dir,source_dir=item['source_dir'],output_dir=output_dir))
+        query = urlencode(dict(input_dir=input_dir,source_dir=item['source_dir'],output_dir=output_dir,ccp4=ccp4))
         location = '<small>'+e(item['source_dir'])+'<br><a href="/?'+e(query)+'#processed-datasets">Open this result directory</a></small>'
         status = ('Ready · selected by default' if item['default_selected'] else 'Ready') if ready else e(item['error'])
         choices += f'<tr><td><input type="checkbox" name="dataset_ids" aria-label="Select {e(item["id"])}" value="{e(item["id"])}" {attributes}></td><td class="path">{e(item["name"])}{location}</td><td>{e(item.get("frame") or "—")}</td><td>{e(item.get("integration_resolution") or "—")}</td><td>{status}</td></tr>'
     assembly_resolution = max(selected_resolutions, default=1.8)
-    raw = f'''<section class="card"><h2>Process diffraction data</h2><p class="muted">Select rotation master files. Companion HDF5 data stays on this workstation. Scale one scan for single-crystal results; process several scans first to compare and select compatible datasets.</p><form method="get" action="/"><input type="hidden" name="output_dir" value="{e(output_dir)}"><label for="input_dir">Input directory</label><input id="input_dir" name="input_dir" value="{e(input_dir)}"><input type="hidden" name="source_dir" value="{e(source_dir)}"><div class="actions"><button class="secondary">Discover scans</button>{browse("input_dir", "Browse data directory")}</div></form><form method="post" action="/jobs"><input type="hidden" name="input_dir" value="{e(input_dir)}"><div class="scroll"><table><thead><tr><th></th><th>Master file</th><th>Frames</th><th>Companions</th></tr></thead><tbody>{rows or '<tr><td colspan="4">No usable master files found.</td></tr>'}</tbody></table></div>{output_field('process_output_dir')}<details open><summary>Processing parameters</summary>{parameters('process')}</details><div class="actions"><button name="mode" value="process">Process selected scans</button><button class="secondary" name="mode" value="both">Process and scale / assemble</button></div></form></section>'''
-    assembly = f'''<section class="card" id="processed-datasets"><h2>Assemble processed datasets</h2><p class="muted">Choose your output folder, a job folder, a result directory, or a crystal folder. The search includes job subfolders and separate runs. One completed version per scan is selected by default; you can select other versions below. A new job receives its own copy of the exported data.</p><form method="get" action="/"><input type="hidden" name="output_dir" value="{e(output_dir)}"><label for="source_dir">Processed-data directory</label><input id="source_dir" name="source_dir" value="{e(source_dir)}"><input type="hidden" name="input_dir" value="{e(input_dir)}"><div class="actions"><button class="secondary">Find processed datasets</button>{browse("source_dir", "Browse processed results")}</div></form><form method="post" action="/jobs"><input type="hidden" name="source_dir" value="{e(source_dir)}"><div class="scroll"><table><thead><tr><th></th><th>Dataset / result directory</th><th>Selected last frame</th><th>Integration limit (Å)</th><th>Status</th></tr></thead><tbody>{choices or '<tr><td colspan="5">No processed datasets found in this folder or its job subfolders.</td></tr>'}</tbody></table></div>{output_field('assembly_output_dir')}<details open><summary>Assembly parameters</summary><p class="muted">Defaults use the selected results' integration limits. Check the cutoffs if you change the dataset selection.</p>{parameters('assemble',assembly_resolution)}</details><div class="actions"><button name="mode" value="assemble">Scale / assemble selected datasets</button><button class="secondary" name="mode" value="compare">Compare selected datasets</button></div></form></section>'''
+    raw = f'''<section class="card"><h2>Process diffraction data</h2><p class="muted">Select rotation master files. Companion HDF5 data stays on this workstation. Scale one scan for single-crystal results; process several scans first to compare and select compatible datasets.</p><form method="get" action="/">{hidden_ccp4}<input type="hidden" name="output_dir" value="{e(output_dir)}"><label for="input_dir">Input directory</label><input id="input_dir" name="input_dir" value="{e(input_dir)}"><input type="hidden" name="source_dir" value="{e(source_dir)}"><div class="actions"><button class="secondary">Discover scans</button>{browse("input_dir", "Browse data directory")}</div></form><form method="post" action="/jobs">{hidden_ccp4}<input type="hidden" name="input_dir" value="{e(input_dir)}"><div class="scroll"><table><thead><tr><th></th><th>Master file</th><th>Frames</th><th>Companions</th></tr></thead><tbody>{rows or '<tr><td colspan="4">No usable master files found.</td></tr>'}</tbody></table></div>{output_field('process_output_dir')}<details open><summary>Processing parameters</summary>{parameters('process')}</details><div class="actions"><button name="mode" value="process">Process selected scans</button><button class="secondary" name="mode" value="both">Process and scale / assemble</button></div></form></section>'''
+    assembly = f'''<section class="card" id="processed-datasets"><h2>Assemble processed datasets</h2><p class="muted">Choose your output folder, a job folder, a result directory, or a crystal folder. The search includes job subfolders and separate runs. One completed version per scan is selected by default; you can select other versions below. A new job receives its own copy of the exported data.</p><form method="get" action="/">{hidden_ccp4}<input type="hidden" name="output_dir" value="{e(output_dir)}"><label for="source_dir">Processed-data directory</label><input id="source_dir" name="source_dir" value="{e(source_dir)}"><input type="hidden" name="input_dir" value="{e(input_dir)}"><div class="actions"><button class="secondary">Find processed datasets</button>{browse("source_dir", "Browse processed results")}</div></form><form method="post" action="/jobs">{hidden_ccp4}<input type="hidden" name="source_dir" value="{e(source_dir)}"><div class="scroll"><table><thead><tr><th></th><th>Dataset / result directory</th><th>Selected last frame</th><th>Integration limit (Å)</th><th>Status</th></tr></thead><tbody>{choices or '<tr><td colspan="5">No processed datasets found in this folder or its job subfolders.</td></tr>'}</tbody></table></div>{output_field('assembly_output_dir')}<details open><summary>Assembly parameters</summary><p class="muted">Defaults use the selected results' integration limits. Check the cutoffs if you change the dataset selection.</p>{parameters('assemble',assembly_resolution)}</details><div class="actions"><button name="mode" value="assemble">Scale / assemble selected datasets</button><button class="secondary" name="mode" value="compare">Compare selected datasets</button></div></form></section>'''
+    installation = '<section class="card"><h2>CCP4 installation</h2><form method="get" action="/">'+''.join('<input type="hidden" name="'+name+'" value="'+e(value)+'">' for name,value in [('input_dir',input_dir),('source_dir',source_dir),('output_dir',output_dir)])+field('ccp4','CCP4 installation directory',ccp4,'text',note='Default detected using which aimless. Choose an installation directory or its bin folder.')+'<div class="actions"><button>Apply CCP4 location</button><button class="secondary" name="detect_ccp4" value="true">Detect from PATH</button>'+browse('ccp4','Choose CCP4 directory')+'</div></form><small>Used for scan discovery and submitted jobs. The app remembers your choice; each job keeps its selected installation.</small></section>'
     selection = '<section class="card"><h2>Output destination</h2><p>'+e(output_dir)+'</p><div class="actions">'+browse('output_dir','Choose output directory')+find_outputs()+'</div></section>'
     if comparison:
-        assembly = comparison_html(comparison,source_dir,input_dir,output_dir) + assembly
+        assembly = comparison_html(comparison,source_dir,input_dir,output_dir,ccp4) + assembly
     side = '<aside><section class="card"><h2>Jobs</h2><p class="muted">One processing job runs at a time. Additional jobs wait in the queue.</p>' + job_list(jobs) + '</section><section class="card"><h2>Output</h2><p class="path muted">' + e(settings.jobs_root) + '</p><p>Each job keeps its parameters, logs, plots, statistics and downloadable MTZ files.</p></section></aside>'
-    return page('Workspace', '<h1>Run PyMDA</h1>' + notice + '<div class="grid"><div>' + selection + raw + assembly + '</div>' + side + '</div>')
+    return page('Workspace', '<h1>Run PyMDA</h1>' + notice + '<div class="grid"><div>' + installation + selection + raw + assembly + '</div>' + side + '</div>')
 
 
 def load_json(path, default=None):
@@ -158,7 +160,7 @@ def detail(job, refresh=True, log_file='job.stdout.log'):
     if job['status'] in RESUMABLE:
         controls += f'<form class="inline" method="post" action="/jobs/{identifier}/resume"><button>Resume completed stages</button></form>'
     if list(output.glob('crystals/*/manifest.json')):
-        controls += f'<a class="button secondary" href="/?{e(urlencode({"source_dir": str(output)}))}">New assembly from these datasets</a>'
+        controls += f'<a class="button secondary" href="/?{e(urlencode({"source_dir": str(output), "ccp4":job["params"].get("ccp4","")}))}">New assembly from these datasets</a>'
     top = f'<h1>Job {e(identifier[:10])}</h1><section class="card"><span class="badge {e(job["status"])}">{e(job["status"])}</span><h2>{e(job["stage"])}</h2><p>{e(job["message"])}</p><p class="muted">{e(job["params"]["mode"])} · Created {e(job["created"])}<br>Output: {e(output)}</p><div class="actions">{controls}</div></section>'
     manifests = list(output.glob('crystals/*/manifest.json'))
     trials = load_json(output / 'trials.json', [])
@@ -199,7 +201,7 @@ def detail(job, refresh=True, log_file='job.stdout.log'):
         results += '<section class="card"><h2>Scaling trials</h2><p>'+('No trial met the configured quality thresholds. Inspect completeness and signal before changing the criteria.' if not any(t['eligible'] for t in trials) else 'Finalization is pending; these scaling statistics are available.')+'</p><div class="scroll"><table><tr><th>Prefixes</th><th>Å</th><th>I/σ(I), overall / outer</th><th>CC½, outer</th><th>Completeness, overall / outer</th><th>Quality</th></tr>'+rows+'</table></div><p>'+file_link(identifier,'trials.json','Trial statistics JSON')+'</p></section>'
     if comparison:
         results += '<p>'+file_link(identifier,'comparison.json','Download compatibility comparison')+'</p>'
-        results += comparison_html(comparison,str(output),'','')
+        results += comparison_html(comparison,str(output),'','',job['params'].get('ccp4',''))
     if manifests:
         rows = ''
         wedge_rows = ''
@@ -242,7 +244,7 @@ def detail(job, refresh=True, log_file='job.stdout.log'):
     return page('Job ' + identifier[:10], top + results + logs + params, active and refresh)
 
 
-def comparison_html(data, source_dir, input_dir='', output_dir=''):
+def comparison_html(data, source_dir, input_dir='', output_dir='', ccp4=''):
     rows = ''.join('<tr><td>'+e(d['name'])+'</td><td>'+e(d['space_group'])+'</td><td>'+e(', '.join(f'{v:.3f}' for v in d['cell']))+'</td></tr>' for d in data['datasets'])
     body = '<section class="card"><h2>Crystal compatibility</h2><p>'+e(data['method'])+'</p><p>Criteria: '+e(data['criteria'])+'</p><table><tr><th>Dataset</th><th>Symmetry</th><th>Unit cell (Å, degrees)</th></tr>'+rows+'</table><div class="scroll"><table><tr><th>Intensity correlation</th>'
     lookup = {frozenset((p['a'],p['b'])):p for p in data['pairs']}
@@ -261,5 +263,5 @@ def comparison_html(data, source_dir, input_dir='', output_dir=''):
         body += '</tr>'
     body += '</table></div><p>Suggested groups (every pair passes the criteria):</p>'
     for index, group in enumerate(data['groups'],1):
-        body += '<p><a class="button secondary" href="/?'+e(urlencode(dict(source_dir=source_dir,input_dir=input_dir,output_dir=output_dir,group=index)))+'">Select group '+str(index)+' ('+str(len(group))+' datasets)</a></p>'
+        body += '<p><a class="button secondary" href="/?'+e(urlencode(dict(source_dir=source_dir,input_dir=input_dir,output_dir=output_dir,ccp4=ccp4,group=index)))+'">Select group '+str(index)+' ('+str(len(group))+' datasets)</a></p>'
     return body+'</section>'

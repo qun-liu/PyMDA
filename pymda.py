@@ -15,7 +15,7 @@ import math
 from pathlib import Path
 import shutil
 import sys
-from autoDials import Toolchain
+from autoDials import Toolchain, default_ccp4
 from helpers import discover_masters, dataset_id, frame_wedges, aimless_stats, admissible
 
 
@@ -27,7 +27,9 @@ def options():
     p.add_argument('--cell_angle_tolerance', type=float, default=2)
     p.add_argument('--min_pair_cc', type=float, default=0.9)
     p.add_argument('--min_common', type=int, default=100)
-    p.add_argument('--ccp4', default='/home/aa1/ccp47')
+    detected = default_ccp4()
+    p.add_argument('--ccp4', default=str(detected) if detected else None,
+                   help='CCP4 installation; defaults to PYMDA_CCP4 or the installation found by which aimless')
     p.add_argument('--hdf5_path', default='~/.codex/pymda_data')
     p.add_argument('--master_files', nargs='+', help='Process only these discovered rotation master files')
     p.add_argument('--dir_output', default='~/.codex/pymda_output')
@@ -455,6 +457,7 @@ def main():
     if not args.run_dials and not args.run_mda and not args.compare:
         raise ValueError('Choose --run_dials and/or --run_mda, or --discover')
     tools = Toolchain(args.ccp4)
+    args.ccp4 = str(tools.root)
     out = Path(args.dir_output).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     source_dir = Path(__file__).resolve().parent

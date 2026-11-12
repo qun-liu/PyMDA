@@ -1,5 +1,5 @@
 """Validated job specifications, isolated outputs and a durable SQLite queue."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -15,6 +15,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from helpers import discover_masters
+from autoDials import ccp4_directory, default_ccp4
 
 ROOT = Path(__file__).resolve().parent.parent
 TERMINAL = {'succeeded', 'partial', 'failed', 'cancelled', 'interrupted'}
@@ -30,7 +31,7 @@ class Settings:
     input_root: Path
     output_root: Path
     jobs_root: Path
-    ccp4: Path = Path('/home/aa1/ccp47')
+    ccp4: Path | None = field(default_factory=default_ccp4)
     pipeline: Path = ROOT / 'pymda.py'
     python: str = sys.executable
     testing: bool = False
@@ -40,7 +41,7 @@ class Settings:
         output = Path(os.getenv('PYMDA_OUTPUT_ROOT', '~/.codex/pymda_output')).expanduser().resolve()
         return cls(Path(os.getenv('PYMDA_INPUT_ROOT', '~/.codex/pymda_data')).expanduser().resolve(),
                    output, Path(os.getenv('PYMDA_JOBS_ROOT', str(output / 'jobs'))).expanduser().resolve(),
-                   Path(os.getenv('PYMDA_CCP4', '/home/aa1/ccp47')).expanduser().resolve())
+                   default_ccp4())
 
     @property
     def database(self):
@@ -98,6 +99,7 @@ class JobSpec(BaseModel):
     min_pair_cc: float = Field(default=0.9, ge=-1, le=1, allow_inf_nan=False)
     min_common: int = Field(default=100, ge=3)
     output_dir: str = ''
+    ccp4: str = ''
     mode: str = 'process'
     input_dir: str = ''
     master_files: list[str] = Field(default_factory=list)
@@ -264,6 +266,7 @@ def source_catalog(source):
 
 def validate_spec(spec, settings):
     spec = spec.model_copy(deep=True)
+    spec.ccp4 = str(ccp4_directory(spec.ccp4 or settings.ccp4 or default_ccp4()))
     if spec.mode in {'process', 'both'}:
         if spec.frames is not None and spec.split_wedges > spec.frames:
             raise ValueError('Consecutive wedge count cannot exceed the pilot frame limit')
@@ -434,7 +437,7 @@ def prepare_assembly(job, spec):
 
 
 def command_for(spec, output, settings):
-    command = [settings.python, '-u', str(settings.pipeline), '--ccp4', str(settings.ccp4),
+    command = [settings.python, '-u', str(settings.pipeline), '--ccp4', spec.ccp4 or str(settings.ccp4 or default_ccp4()),
                '--hdf5_path', spec.input_dir, '--dir_output', str(output),
                '--thread', str(spec.thread), '--merge_workers', str(spec.merge_workers),
                '--wedges', str(spec.wedges), '--reso', str(spec.reso),
