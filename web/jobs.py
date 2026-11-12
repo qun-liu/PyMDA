@@ -50,16 +50,44 @@ class Settings:
 def contained(path, roots):
     path = Path(path).expanduser().resolve()
     if not any(path == Path(r).resolve() or Path(r).resolve() in path.parents for r in roots):
-        raise ValueError('Directory is outside the configured data or output roots')
+        raise ValueError('File is outside the result directory')
     return path
 
 
 def local_directory(path, writable=False):
     directory = Path(path).expanduser().resolve()
     if not directory.is_dir():
+        if directory.exists():
+            raise ValueError('Path is not a directory: %s' % directory)
         raise ValueError('Directory does not exist: %s' % directory)
-    if writable and not os.access(directory, os.W_OK | os.X_OK):
-        raise ValueError('Output directory is not writable: %s' % directory)
+    if not os.access(directory, (os.W_OK if writable else os.R_OK) | os.X_OK):
+        message = 'Output directory is not writable' if writable else 'Directory is not readable'
+        raise ValueError('%s: %s' % (message, directory))
+    return directory
+
+
+def default_directory(*paths, writable=False):
+    """Use an accessible starting folder when saved/default locations disappear."""
+    for path in (*paths, Path.home(), Path('/')):
+        if not path:
+            continue
+        try:
+            return local_directory(path, writable=writable)
+        except (ValueError, OSError):
+            pass
+    raise ValueError('No accessible %s directory found' % ('output' if writable else 'starting'))
+
+
+def output_directory(path, create=False):
+    """Validate an output folder or its existing parent; create only on request."""
+    directory = Path(path).expanduser().resolve()
+    parent = directory
+    while not parent.exists():
+        parent = parent.parent
+    local_directory(parent, writable=True)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+        local_directory(directory, writable=True)
     return directory
 
 
@@ -182,7 +210,7 @@ def source_mtz(manifest, reference):
     for candidate in candidates:
         try:
             path = contained(candidate, [crystal])
-            if path.is_file() and path.stat().st_size:
+            if path.is_file() and path.stat().st_size and os.access(path, os.R_OK):
                 return path
         except (ValueError,OSError):
             pass
@@ -239,19 +267,22 @@ def validate_spec(spec, settings):
     if spec.mode in {'process', 'both'}:
         if spec.frames is not None and spec.split_wedges > spec.frames:
             raise ValueError('Consecutive wedge count cannot exceed the pilot frame limit')
-        directory = contained(spec.input_dir or settings.input_root, [settings.input_root])
-        if not directory.is_dir():
-            raise ValueError('Input directory does not exist')
+        directory = local_directory(spec.input_dir) if spec.input_dir else default_directory(
+            os.getenv('PYMDA_START_INPUT_DIR'), settings.input_root, ROOT)
         available = set(discover_masters(directory))
-        selected = [contained(p, [settings.input_root]) for p in spec.master_files]
+        selected = [Path(p).expanduser().resolve() for p in spec.master_files]
         if not selected or any(p not in available for p in selected):
             raise ValueError('Select existing rotation master files from the input directory')
+        for path in selected:
+            if not os.access(path, os.R_OK):
+                raise ValueError('Master file is not readable: %s' % path)
         spec.master_files = list(map(str, sorted(set(selected))))
         spec.input_dir = str(directory)
         if spec.mode == 'both' and spec.subset_search == 'exhaustive' and len(spec.master_files) > 10:
             raise ValueError('Use auto or bounded search for more than ten datasets')
     else:
-        source = local_directory(spec.source_dir or settings.output_root)
+        source = local_directory(spec.source_dir) if spec.source_dir else default_directory(
+            os.getenv('PYMDA_START_SOURCE_DIR'), settings.output_root, settings.jobs_root, ROOT)
         entries = {entry['id']: entry for entry in source_catalog(source)}
         ids = sorted(set(spec.dataset_ids or [key for key,entry in entries.items() if entry['default_selected']]))
         if not ids or not set(ids).issubset(entries):
@@ -274,7 +305,7 @@ def validate_spec(spec, settings):
     if spec.reso_cchalf < spec.reso:
         raise ValueError('Prefix assessment cutoff must be at least the integration cutoff')
     if spec.output_dir:
-        spec.output_dir = str(local_directory(spec.output_dir, writable=True))
+        spec.output_dir = str(output_directory(spec.output_dir))
     return spec
 
 

@@ -2,6 +2,7 @@
 import json
 import math
 from pathlib import Path
+import shutil
 import sys
 from iotbx import mtz
 from autoDials import Toolchain
@@ -44,7 +45,17 @@ def compare(source, ccp4, cutoff, length_tolerance, angle_tolerance, min_cc, min
                 ref = Path(records[i][1]['selected']['mtz'])
                 target = Path(records[j][1]['selected']['mtz'])
                 work = source/'comparisons'/f'{i+1}_{j+1}'
-                tools.run('pointless', ['hklin', target, 'hklref', ref, 'hklout', 'aligned.mtz'], work, 'END\n', ['aligned.mtz'])
+                work.mkdir(parents=True, exist_ok=True)
+                # Pointless splits command-line filenames containing spaces.
+                # Local names preserve access to exports in any source folder.
+                for name, original in [('reference.mtz',ref),('target.mtz',target)]:
+                    local = work/name
+                    local.unlink(missing_ok=True)
+                    try:
+                        local.symlink_to(original.resolve())
+                    except OSError:
+                        shutil.copy2(original,local)
+                tools.run('pointless', ['hklin', 'target.mtz', 'hklref', 'reference.mtz', 'hklout', 'aligned.mtz'], work, 'END\n', ['aligned.mtz'])
                 x,y = intensity(ref,cutoff),intensity(work/'aligned.mtz',cutoff)
                 x,y = x.common_sets(y, assert_is_similar_symmetry=True)
                 pair['common_reflections'] = x.size()

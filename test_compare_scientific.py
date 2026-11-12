@@ -15,7 +15,7 @@ class ComparisonTests(unittest.TestCase):
         original = Path(os.environ['PYMDA_TEST_MTZ'])
         x = intensity(original, 2.5)
         self.assertAlmostEqual(x.correlation(x).coefficient(),1)
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(prefix='pymda comparison with spaces ') as temp:
             root = Path(temp)
             for name in ('A','B','C'):
                 directory = root/'crystals'/name

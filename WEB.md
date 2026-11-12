@@ -55,9 +55,14 @@ Default paths:
 
 Override them with `PYMDA_INPUT_ROOT`, `PYMDA_OUTPUT_ROOT`,
 `PYMDA_JOBS_ROOT`, and `PYMDA_CCP4` before starting. The process needs write
-access to the jobs directory. Raw-data discovery stays within the configured
-input root. Output and processed-result directories can be selected elsewhere
-on the server workstation; output folders must exist and be writable.
+access to the jobs directory. These paths are starting locations, not access
+limits. Input and processed-result folders can be anywhere the workstation
+account has read and traversal access. Output folders can be anywhere it has
+write and traversal access; missing output folders are created when a valid job
+is submitted. Directory browsing and workspace visits do not create folders.
+Deleted or inaccessible saved/default folders fall back to an accessible
+starting location. Explicitly selected input and processed-result folders must
+exist.
 Use `python run_web.py --port 8001` to change the port.
 
 The API provides `GET /api/datasets`, `GET /api/processed-datasets?source_dir=...`, `GET/POST /api/jobs`,
@@ -107,15 +112,16 @@ The heatmap reports missing correlations and overlap counts. Suggested groups
 require every pair to pass; select a group, adjust individual checkboxes, then
 submit assembly. Comparison and selection JSON preserve the evidence and choices.
 
-Use **Choose output directory** beside either output field to select any
-writable folder on the server workstation. The browser offers parent-folder,
+Use **Browse data directory**, **Browse processed results**, or **Choose output
+directory** to select accessible folders anywhere on the server workstation.
+The browser offers parent-folder,
 home-folder and filesystem-root navigation, a folder-path field, and **Create
 folder**. Click **Use this directory** to apply the selection to processing and
 assembly. The app remembers it in this browser for subsequent workspace visits.
 Results saved outside the default output root can also be selected for assembly.
 Outputs use `<chosen directory>/<job id>/output`;
 the durable queue stays under `PYMDA_JOBS_ROOT`. The output browser can create
-folders.
+folders, or you can enter a new output path directly in the job form.
 
 Click **Find processed datasets in this output folder** beside the output
 destination to list the results already saved there. The search finds

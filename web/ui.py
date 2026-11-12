@@ -99,7 +99,7 @@ def home(settings, jobs, input_dir, datasets, source_dir, sources, error='', out
         query = urlencode(dict(input_dir=input_dir,source_dir=output_dir,output_dir=output_dir))
         return '<a class="button secondary" href="/?'+e(query)+'#processed-datasets">Find processed datasets in this output folder</a>'
     def output_field(identifier):
-        return field('output_dir','Output directory',output_dir,'text',attrs='required',identifier=identifier)+'<div class="actions">'+browse('output_dir','Choose output directory')+find_outputs()+'</div><small>Each job gets its own folder inside the selected directory.</small>'
+        return field('output_dir','Output directory',output_dir,'text',attrs='required',identifier=identifier)+'<div class="actions">'+browse('output_dir','Choose output directory')+find_outputs()+'</div><small>Each job gets its own folder inside the selected directory. New output folders are created when a job is submitted.</small>'
     notice = f'<div class="notice error">{e(error)}</div>' if error else ''
     rows = ''
     for item in datasets:

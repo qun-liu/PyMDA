@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from autoDials import Toolchain
 from helpers import discover_masters
-from web.jobs import ROOT, JobSpec, JobStore, Settings, contained, local_directory, source_catalog, validate_spec
+from web.jobs import ROOT, JobSpec, JobStore, Settings, contained, default_directory, local_directory, output_directory, source_catalog, validate_spec
 from web import ui
 
 
@@ -125,26 +125,30 @@ def create_app(settings=None, start_worker=True, inspector=inspect_datasets):
                     frames = dataset.get('frames')
                     if frames and spec.split_wedges > min(frames, spec.frames or frames):
                         raise ValueError('Consecutive wedge count exceeds the number of frames in %s' % dataset['name'])
+            if spec.output_dir:
+                output_directory(spec.output_dir, create=True)
         except (ValueError,OSError,KeyError,subprocess.SubprocessError) as error:
             raise HTTPException(422,str(error)) from error
         return store.create(spec)
 
     @app.get('/',response_class=HTMLResponse)
     def home(request: Request, input_dir: str='', source_dir: str='', output_dir: str='', group: int=0):
-        input_dir = input_dir or os.getenv('PYMDA_START_INPUT_DIR',str(settings.input_root))
+        input_dir = input_dir or str(default_directory(os.getenv('PYMDA_START_INPUT_DIR'), settings.input_root, ROOT))
         data, sources, errors = [], [], []
-        default_output = settings.output_root if settings.output_root.is_dir() else settings.jobs_root
-        output_dir = output_dir or unquote(request.cookies.get('pymda_output_dir', '')) or str(default_output)
+        default_output = default_directory(settings.output_root, settings.jobs_root, ROOT, writable=True)
+        output_dir = output_dir or str(default_directory(
+            unquote(request.cookies.get('pymda_output_dir', '')), default_output, writable=True))
         try:
-            output_dir = str(local_directory(output_dir, writable=True))
+            output_dir = str(output_directory(output_dir))
         except (ValueError,OSError) as error:
             errors.append(str(error))
             output_dir = str(default_output)
-        source_dir = source_dir or unquote(request.cookies.get('pymda_source_dir', '')) or os.getenv('PYMDA_START_SOURCE_DIR',output_dir)
+        source_dir = source_dir or str(default_directory(
+            unquote(request.cookies.get('pymda_source_dir', '')), os.getenv('PYMDA_START_SOURCE_DIR'),
+            output_dir, settings.output_root, settings.jobs_root, ROOT))
         try:
-            directory = contained(input_dir,[settings.input_root])
-            if not directory.is_dir():
-                raise ValueError('Input directory does not exist')
+            directory = local_directory(input_dir)
+            input_dir = str(directory)
             data = inspector(discover_masters(directory),settings)
         except (ValueError,OSError,subprocess.SubprocessError) as error:
             errors.append(str(error))
@@ -164,41 +168,52 @@ def create_app(settings=None, start_worker=True, inspector=inspect_datasets):
     @app.get('/api/processed-datasets')
     def processed_datasets(source_dir: str=''):
         try:
-            source = local_directory(source_dir or settings.output_root)
+            source = local_directory(source_dir) if source_dir else default_directory(
+                os.getenv('PYMDA_START_SOURCE_DIR'), settings.output_root, settings.jobs_root, ROOT)
             return [{key:value for key,value in entry.items() if key not in {'manifest','record'}} for entry in source_catalog(source)]
         except (ValueError,OSError) as error:
             raise HTTPException(422,str(error)) from error
 
     @app.get('/browse', response_class=HTMLResponse)
     def browse(request: Request, kind: str='input_dir', path: str='', input_dir: str='', source_dir: str='', output_dir: str=''):
-        roots = [settings.input_root] if kind == 'input_dir' else [Path('/')]
         if kind not in {'input_dir','source_dir','output_dir'}:
             raise HTTPException(422,'Invalid directory type')
         try:
-            defaults = {'input_dir': input_dir or str(settings.input_root),
-                        'source_dir': source_dir or str(settings.output_root),
-                        'output_dir': output_dir or unquote(request.cookies.get('pymda_output_dir', '')) or str(settings.output_root)}
-            directory = local_directory(contained(path or defaults[kind], roots))
+            defaults = {'input_dir': (os.getenv('PYMDA_START_INPUT_DIR'), settings.input_root, ROOT),
+                        'source_dir': (unquote(request.cookies.get('pymda_source_dir', '')),
+                                       os.getenv('PYMDA_START_SOURCE_DIR'), settings.output_root, settings.jobs_root, ROOT),
+                        'output_dir': (unquote(request.cookies.get('pymda_output_dir', '')),
+                                       settings.output_root, settings.jobs_root, ROOT)}
+            selected = {'input_dir': input_dir, 'source_dir': source_dir, 'output_dir': output_dir}[kind]
+            requested = Path(path or selected).expanduser().resolve() if path or selected else default_directory(*defaults[kind])
+            directory = requested
+            notice = ''
+            if kind == 'output_dir' and not requested.exists():
+                # Browsing never creates directories; the form below can do so.
+                while not directory.exists():
+                    directory = directory.parent
+                notice = '<p class="notice">'+ui.e(requested)+' does not exist yet. Opened its parent folder; create a folder below or enter the new output path when submitting a job.</p>'
+            directory = local_directory(directory)
             state = dict(kind=kind,input_dir=input_dir,source_dir=source_dir,output_dir=output_dir)
             def link(target, label):
                 return '<p><a class="button secondary" href="/browse?'+ui.e(urlencode(dict(state,path=str(target))))+'">'+ui.e(label)+'</a></p>'
             title = {'input_dir':'Choose data directory','source_dir':'Choose processed-data directory','output_dir':'Choose output directory'}[kind]
             hidden = ''.join('<input type="hidden" name="'+key+'" value="'+ui.e(value)+'">' for key,value in state.items())
-            body = '<h1>'+title+'</h1><form method="get" action="/browse">'+hidden+'<label for="browse_path">Folder path</label><input id="browse_path" name="path" value="'+ui.e(directory)+'"><div class="actions"><button class="secondary">Open directory</button></div></form>'
-            for target,label in ([(settings.input_root,'Input root')] if kind == 'input_dir' else [(Path.home(),'Home folder'),(Path('/'),'Filesystem root')]):
-                if target != directory:
-                    body += link(target,label)
-            try:
-                contained(directory.parent,roots)
-                if directory.parent != directory:
-                    body += link(directory.parent,'Parent directory')
-            except ValueError:
-                pass
+            body = '<h1>'+title+'</h1>'+notice+'<form method="get" action="/browse">'+hidden+'<label for="browse_path">Folder path</label><input id="browse_path" name="path" value="'+ui.e(directory)+'"><div class="actions"><button class="secondary">Open directory</button></div></form>'
+            targets = [(Path.home(),'Home folder'),(Path('/'),'Filesystem root'),(directory.parent,'Parent directory')]
+            if kind == 'input_dir':
+                targets.insert(0,(settings.input_root,'Default data directory'))
+            for target,label in targets:
+                try:
+                    target = local_directory(target)
+                    if target != directory:
+                        body += link(target,label)
+                except (ValueError,OSError):
+                    pass
             for child in sorted(directory.iterdir()):
                 try:
                     if child.is_dir():
-                        contained(child,roots)
-                        body += link(child,child.name)
+                        body += link(local_directory(child),child.name)
                 except (ValueError,OSError):
                     pass
             values = dict(input_dir=input_dir,source_dir=source_dir,output_dir=output_dir)
@@ -231,7 +246,8 @@ def create_app(settings=None, start_worker=True, inspector=inspect_datasets):
     @app.get('/api/datasets')
     def datasets(input_dir: str=''):
         try:
-            directory = contained(input_dir or os.getenv('PYMDA_START_INPUT_DIR',str(settings.input_root)),[settings.input_root])
+            directory = local_directory(input_dir) if input_dir else default_directory(
+                os.getenv('PYMDA_START_INPUT_DIR'), settings.input_root, ROOT)
             return inspector(discover_masters(directory),settings)
         except (ValueError,OSError,subprocess.SubprocessError) as error:
             raise HTTPException(422,str(error)) from error

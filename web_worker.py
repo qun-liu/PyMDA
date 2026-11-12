@@ -84,10 +84,10 @@ def stage_from_log(path):
 def run_job(store, job):
     process = None
     output = Path(job['output_dir'])
-    output.mkdir(parents=True, exist_ok=True)
     log = output / 'job.stdout.log'
     try:
         spec = validate_spec(JobSpec(**job['params']), store.settings)
+        output.mkdir(parents=True, exist_ok=True)
         if spec.mode in {'assemble', 'compare'}:
             prepare_assembly(job, spec)
         if STOP or store.get(job['id'])['cancel_requested']:
@@ -140,8 +140,11 @@ def run_job(store, job):
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
-        with log.open('a') as stream:
-            stream.write('\nWorker: %s\n' % error)
+        try:
+            with log.open('a') as stream:
+                stream.write('\nWorker: %s\n' % error)
+        except OSError:
+            pass
         store.update(job['id'], status='interrupted' if STOP else 'failed', finished=now(), pid=None,
                      stage='Interrupted' if STOP else 'Failed', message=str(error))
 

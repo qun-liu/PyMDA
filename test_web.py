@@ -8,11 +8,13 @@ import time
 import unittest
 import re
 from html import unescape
+from http.cookies import SimpleCookie
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from main import create_app
 from web.jobs import JobSpec, JobStore, Settings, command_for, prepare_assembly, source_catalog, validate_spec
+from web_worker import run_job
 
 BASE_URL = 'http://127.0.0.1:8000'
 
@@ -81,9 +83,87 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.client.post('/api/jobs',json=self.payload(**extra)).status_code,422)
         self.assertEqual(self.client.get('/api/jobs').json(),[])
 
-    def test_reject_unselected_or_external_files(self):
-        for extra in [{'master_files':[]},{'input_dir':'/tmp','master_files':[str(self.master)]},{'master_files':['/etc/passwd']}]:
+    def test_reject_unselected_or_undiscovered_files(self):
+        other=self.output.parent/'other input'; other.mkdir()
+        for extra in [{'master_files':[]},{'input_dir':str(other),'master_files':[str(self.master)]},{'master_files':['/etc/passwd']}]:
             self.assertEqual(self.client.post('/api/jobs',json=self.payload(**extra)).status_code,422)
+
+    def test_external_input_directory_discovery_browsing_and_submission(self):
+        directory=self.output.parent/'external input'; directory.mkdir()
+        master=directory/'another_master.h5'; master.touch()
+        alias=self.data/'linked input'; alias.symlink_to(directory,target_is_directory=True)
+        for path in [directory,alias]:
+            with self.subTest(path=path):
+                response=self.client.get('/api/datasets',params={'input_dir':str(path)})
+                self.assertEqual(response.status_code,200,response.text)
+                self.assertEqual([item['path'] for item in response.json()],[str(master)])
+                page=self.client.get('/',params={'input_dir':str(path)})
+                self.assertIn('another_master.h5',page.text)
+                self.assertNotIn('notice error',page.text)
+                response=self.client.get('/browse',params={'kind':'input_dir','path':str(path),'source_dir':str(self.output),'output_dir':str(self.output)})
+                self.assertEqual(response.status_code,200,response.text)
+                for label in ['Home folder','Filesystem root','Parent directory']:
+                    self.assertIn(label,response.text)
+                selected=unescape(re.search(r'href="([^"]+)">Use this directory</a>',response.text).group(1))
+                self.assertIn('another_master.h5',self.client.get(selected).text)
+                response=self.client.post('/api/jobs',json=self.payload(input_dir=str(path),master_files=[str(master)]))
+                self.assertEqual(response.status_code,201,response.text)
+                spec=JobSpec(**response.json()['params'])
+                args=command_for(spec,Path(response.json()['output_dir']),self.settings)
+                self.assertEqual(args[args.index('--hdf5_path')+1],str(directory))
+                self.assertEqual(args[args.index('--master_files')+1],str(master))
+        response=self.client.get('/browse',params={'kind':'input_dir','path':str(self.data)})
+        self.assertIn('linked input',response.text)
+        response=self.client.get('/browse',params={'kind':'input_dir','path':str(self.data.parent)})
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertIn('external input',response.text)
+
+    def test_readable_master_symlink_outside_default_input_root(self):
+        directory=self.output.parent/'master targets'; directory.mkdir()
+        master=directory/'external_master.h5'; master.touch()
+        link=self.data/'external_master.h5'; link.symlink_to(master)
+        datasets=self.client.get('/api/datasets',params={'input_dir':str(self.data)}).json()
+        self.assertIn(str(master),[item['path'] for item in datasets])
+        response=self.client.post('/api/jobs',json=self.payload(master_files=[str(link)]))
+        self.assertEqual(response.status_code,201,response.text)
+        self.assertEqual(response.json()['params']['master_files'],[str(master)])
+
+    def test_missing_input_and_source_directories_still_report_errors(self):
+        missing=self.output.parent/'missing input'
+        for kind,api in [('input_dir','/api/datasets'),('source_dir','/api/processed-datasets')]:
+            with self.subTest(kind=kind):
+                response=self.client.get(api,params={kind:str(missing)})
+                self.assertEqual(response.status_code,422,response.text)
+                self.assertIn('Directory does not exist',response.text)
+                self.assertEqual(self.client.get('/browse',params={'kind':kind,'path':str(missing)}).status_code,422)
+                page=self.client.get('/',params={kind:str(missing)})
+                self.assertIn('Directory does not exist',page.text)
+        self.assertEqual(self.client.post('/api/jobs',json=self.payload(input_dir=str(missing))).status_code,422)
+        self.assertEqual(self.client.post('/api/jobs',json={'mode':'assemble','source_dir':str(missing)}).status_code,422)
+
+    def test_input_and_processed_directories_require_read_and_traversal_access(self):
+        source=self.output/'source'; self.processed_result(source)
+        real_access=os.access
+        for directory,kind,api in [(self.data,'input_dir','/api/datasets'),(source,'source_dir','/api/processed-datasets')]:
+            for denied in [os.R_OK,os.X_OK]:
+                with self.subTest(directory=directory,denied=denied):
+                    def access(path,mode):
+                        return False if Path(path)==directory and mode & denied else real_access(path,mode)
+                    with patch('web.jobs.os.access',side_effect=access):
+                        response=self.client.get(api,params={kind:str(directory)})
+                        self.assertEqual(response.status_code,422,response.text)
+                        self.assertIn('not readable',response.text)
+                        self.assertEqual(self.client.get('/browse',params={'kind':kind,'path':str(directory)}).status_code,422)
+                        self.assertIn('not readable',self.client.get('/',params={kind:str(directory)}).text)
+                        payload=self.payload() if kind=='input_dir' else {'mode':'assemble','source_dir':str(directory)}
+                        self.assertEqual(self.client.post('/api/jobs',json=payload).status_code,422)
+
+    def test_selected_master_requires_read_access(self):
+        real_access=os.access
+        with patch('web.jobs.os.access',side_effect=lambda path,mode: False if Path(path)==self.master and mode & os.R_OK else real_access(path,mode)):
+            response=self.client.post('/api/jobs',json=self.payload())
+            self.assertEqual(response.status_code,422,response.text)
+            self.assertIn('Master file is not readable',response.text)
 
     def test_single_dataset_finalization_and_directory_buttons(self):
         result = self.client.post('/api/jobs',json=self.payload(mode='both', output_dir=str(self.output)))
@@ -124,15 +204,101 @@ class WebTests(unittest.TestCase):
         self.assertTrue((parent/'new results').is_dir())
         self.assertIn('source_dir=',response.headers['location'])
         self.assertIn('input_dir=',response.headers['location'])
-        for path in [str(self.master),str(parent/'missing')]:
+        for path in [str(self.master),str(self.master/'child')]:
             self.assertEqual(self.client.post('/api/jobs',json=self.payload(output_dir=path)).status_code,422)
-        with patch('web.jobs.os.access',return_value=False):
+        real_access=os.access
+        with patch('web.jobs.os.access',side_effect=lambda path,mode: False if Path(path)==parent and mode & os.W_OK else real_access(path,mode)):
             response=self.client.post('/api/jobs',json=self.payload(output_dir=str(parent)))
             self.assertEqual(response.status_code,422)
             self.assertIn('not writable',response.text)
+            response=self.client.post('/api/jobs',json=self.payload(output_dir=str(parent/'missing'/'nested')))
+            self.assertEqual(response.status_code,422,response.text)
+            self.assertFalse((parent/'missing').exists())
             page=self.client.get('/browse',params={'kind':'output_dir','path':str(parent)})
+            self.assertEqual(page.status_code,200,page.text)
             self.assertNotIn('Use this directory',page.text)
             self.assertIn('not writable',page.text)
+
+    def test_new_output_path_is_created_only_for_a_valid_submission(self):
+        directory=self.output.parent/'new output'/'nested results'
+        page=self.client.get('/',params={'output_dir':str(directory)})
+        self.assertEqual(page.status_code,200,page.text)
+        self.assertIn(f'value="{directory}"',page.text)
+        self.assertNotIn('notice error',page.text)
+        self.assertFalse(directory.parent.exists())
+        response=self.client.get('/browse',params={'kind':'output_dir','path':str(directory)})
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertIn('does not exist yet',response.text)
+        self.assertFalse(directory.parent.exists())
+        response=self.client.post('/api/jobs',json=self.payload(output_dir=str(directory),split_wedges=3,frames=2))
+        self.assertEqual(response.status_code,422,response.text)
+        self.assertFalse(directory.parent.exists())
+        unreadable=lambda paths,settings:[dict(d,ready=False) for d in inspector(paths,settings)]
+        with TestClient(create_app(self.settings,start_worker=False,inspector=unreadable),base_url=BASE_URL) as client:
+            response=client.post('/api/jobs',json=self.payload(output_dir=str(directory)))
+            self.assertEqual(response.status_code,422,response.text)
+            self.assertFalse(directory.parent.exists())
+        response=self.client.post('/jobs',data={'mode':'process','input_dir':str(self.data),'master_files':str(self.master),'output_dir':str(directory)},follow_redirects=False)
+        self.assertEqual(response.status_code,303,response.text)
+        self.assertTrue(directory.is_dir())
+        job=self.client.get('/api/jobs/'+response.headers['location'].split('/')[-1]).json()
+        self.assertEqual(job['params']['output_dir'],str(directory))
+        self.assertEqual(Path(job['output_dir']).parent.parent,directory)
+        self.assertIn(f'value="{directory}"',self.client.get('/').text)
+
+    def test_deleted_or_inaccessible_remembered_directories_fall_back(self):
+        missing=self.output.parent/'test1'
+        blocked=self.output.parent/'inaccessible'; blocked.mkdir()
+        real_access=os.access
+        for directory in [missing,blocked]:
+            with self.subTest(directory=directory):
+                self.client.cookies.set('pymda_output_dir',str(directory),domain='127.0.0.1',path='/')
+                self.client.cookies.set('pymda_source_dir',str(directory),domain='127.0.0.1',path='/')
+                with patch('web.jobs.os.access',side_effect=lambda path,mode: False if Path(path)==blocked else real_access(path,mode)):
+                    page=self.client.get('/')
+                self.assertEqual(page.status_code,200,page.text)
+                self.assertNotIn('notice error',page.text)
+                self.assertIn(f'id="source_dir" name="source_dir" value="{self.output}"',page.text)
+                self.assertIn(f'id="process_output_dir" name="output_dir" type="text" value="{self.output}"',page.text)
+                cookies=SimpleCookie()
+                for header in page.headers.get_list('set-cookie'):
+                    cookies.load(header)
+                self.assertEqual(cookies['pymda_output_dir'].value,str(self.output))
+                self.assertEqual(cookies['pymda_source_dir'].value,str(self.output))
+
+    def test_missing_startup_locations_fall_back_for_workspace_browser_api_and_jobs(self):
+        missing=self.output.parent/'removed defaults'
+        settings=Settings(self.data,missing,self.settings.jobs_root,testing=True)
+        self.processed_result(settings.jobs_root/'previous job'/'output')
+        with patch.dict(os.environ,{'PYMDA_START_INPUT_DIR':str(missing),'PYMDA_START_SOURCE_DIR':str(missing)}):
+            with TestClient(create_app(settings,start_worker=False,inspector=inspector),base_url=BASE_URL) as client:
+                page=client.get('/')
+                self.assertEqual(page.status_code,200,page.text)
+                self.assertNotIn('notice error',page.text)
+                self.assertIn('sample_master.h5',page.text)
+                self.assertIn('Open this result directory',page.text)
+                self.assertIn(f'id="process_output_dir" name="output_dir" type="text" value="{settings.jobs_root}"',page.text)
+                for kind in ['input_dir','source_dir','output_dir']:
+                    self.assertEqual(client.get('/browse',params={'kind':kind}).status_code,200)
+                self.assertEqual(client.get('/api/datasets').json()[0]['path'],str(self.master))
+                self.assertTrue(client.get('/api/processed-datasets').json()[0]['ready'])
+                response=client.post('/api/jobs',json={'mode':'process','master_files':[str(self.master)]})
+                self.assertEqual(response.status_code,201,response.text)
+                self.assertEqual(response.json()['params']['input_dir'],str(self.data))
+                response=client.post('/api/jobs',json={'mode':'assemble'})
+                self.assertEqual(response.status_code,201,response.text)
+                self.assertEqual(response.json()['params']['source_dir'],str(settings.jobs_root))
+                self.assertFalse(missing.exists())
+
+    def test_worker_reports_output_creation_failure_in_job_state(self):
+        job=self.client.post('/api/jobs',json=self.payload()).json()
+        store=self.client.app.state.store
+        job=store.claim()
+        with patch('web_worker.Path.mkdir',side_effect=PermissionError('Cannot create job output')):
+            run_job(store,job)
+        result=store.get(job['id'])
+        self.assertEqual(result['status'],'failed')
+        self.assertIn('Cannot create job output',result['message'])
 
     def test_typed_output_directory_is_remembered_after_submission(self):
         directory=self.output.parent/'typed output'; directory.mkdir()
@@ -464,6 +630,19 @@ class WorkerTests(unittest.TestCase):
         job=self.submit();self.assertEqual(await_status(self.client,job['id'],{'succeeded'})['status'],'succeeded')
         failed=self.submit(1);row=await_status(self.client,failed['id'],{'failed'})
         self.assertIn('7',row['message'])
+
+    def test_worker_processes_external_input_into_new_output_directory(self):
+        directory=self.data.parent/'external data'; directory.mkdir()
+        master=directory/'external_master.h5'; master.touch()
+        output=self.data.parent/'external results'/'new collection'
+        response=self.client.post('/api/jobs',json={'mode':'process','input_dir':str(directory),'master_files':[str(master)],'output_dir':str(output)})
+        self.assertEqual(response.status_code,201,response.text)
+        job=await_status(self.client,response.json()['id'],{'succeeded'})
+        self.assertTrue(Path(job['output_dir']).is_relative_to(output))
+        self.assertTrue((Path(job['output_dir'])/'crystals/fake/manifest.json').is_file())
+        args=json.loads((Path(job['output_dir'])/'web_command.json').read_text())
+        self.assertEqual(args[args.index('--hdf5_path')+1],str(directory))
+        self.assertEqual(args[args.index('--master_files')+1],str(master))
 
     def child_for(self, job):
         path=Path(job['output_dir'])/'child.pid';deadline=time.monotonic()+15
