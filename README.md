@@ -106,6 +106,25 @@ Use `--subset_search bounded --max_subsets N` to change the budget, or
 Standalone `uc_rejection.ucr` and `picc_rejection.pr` clustering
 utilities remain available; the CLI subset search does not depend on SciPy.
 
+To finalize a successfully scaled result even when no trial passes the quality
+thresholds, add `--skip_quality_checks`. Measured statistics and the original
+`eligible` pass/fail value remain in `trials.json` and `best.json`; the report
+and `best.json` record that quality checks were bypassed. Actual scaling or
+finalization failures still stop processing.
+
+For one merge of all selected datasets, without searching alternative subsets,
+prefixes or resolution cutoffs, use one cutoff and a bounded search of one:
+
+```bash
+python3 pymda.py --run_mda --dir_output /path/to/processed/output \
+  --dataset_ids ID1 ID2 --resolutions 3.0 --prefix_policy full \
+  --subset_search bounded --max_subsets 1 --skip_quality_checks
+```
+
+Scaling still runs and writes `trials.json`. If that file is empty, inspect the
+trial `failure.json` files and Pointless/Aimless logs; threshold bypass cannot
+recover a failed scaling operation.
+
 ```bash
 python3 -m unittest -v test_pymda
 ```

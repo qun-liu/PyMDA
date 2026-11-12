@@ -283,6 +283,73 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(json.loads((out/'best.json').read_text())['crystals']),1)
             self.assertIn('one rotation dataset',(out/'processing_report.md').read_text())
 
+    def test_cli_quality_bypass_requires_an_explicit_flag(self):
+        from pymda import options
+        with patch('sys.argv',['pymda.py','--run_mda']):
+            self.assertFalse(options().skip_quality_checks)
+        with patch('sys.argv',['pymda.py','--run_mda','--skip_quality_checks']):
+            self.assertTrue(options().skip_quality_checks)
+
+    def test_quality_bypass_finalizes_failed_thresholds_without_changing_statistics(self):
+        from pymda import assemble
+        with tempfile.TemporaryDirectory() as temp:
+            out=Path(temp)
+            mtz=out/'integrated.mtz'; mtz.write_bytes(b'MTZ input')
+            stats={'resolution':[2.5,10,2.5],'isigi':[2,4,-.2],'cc_half':[.8,.9,.05],'completeness':[50,60,45]}
+            prefix={'mtz':str(mtz),'last_frame':180,'statistics':stats}
+            record={'config':{'master':'one_master.h5'},'selected':prefix,'prefixes':[prefix]}
+            def scaling(tools,paths,directory,resolution):
+                directory.mkdir(parents=True,exist_ok=True)
+                for name in ['scaled.mtz','sorted.mtz','aimless.console.log','pointless.console.log','statistics.json','inputs.json']:
+                    (directory/name).write_bytes(b'MTZ scaling result')
+                return stats
+            class Tools:
+                def run(self,name,args,directory,stdin=None,expected=()):
+                    for target in expected:
+                        (directory/target).write_bytes(b'MTZ final result')
+            args=SimpleNamespace(prefix_policy='full',resolutions=[2.5],reso=1.8,thread=1,merge_workers=1,
+                min_completeness=90,min_outer_completeness=80,min_cc_half=.3,min_isigi=1,nres=None,
+                crystal_identity='unknown',skip_quality_checks=False)
+            with patch('pymda.scale',side_effect=scaling),patch('builtins.print'):
+                with self.assertRaisesRegex(RuntimeError,'No trial meets the stated quality thresholds'):
+                    assemble(Tools(),[record],out,args)
+                self.assertFalse((out/'best/final.mtz').exists())
+                args.skip_quality_checks=True
+                assemble(Tools(),[record],out,args)
+            self.assertTrue((out/'best/final.mtz').is_file())
+            best=json.loads((out/'best.json').read_text())
+            self.assertTrue(best['quality_checks_skipped'])
+            self.assertFalse(best['eligible'])
+            self.assertEqual(best['statistics'],stats)
+            self.assertEqual(best['thresholds']['completeness_overall'],90)
+            self.assertEqual(best['thresholds']['isigi_outer'],1)
+            trials=json.loads((out/'trials.json').read_text())
+            self.assertEqual(len(trials),1)
+            self.assertFalse(trials[0]['eligible'])
+            report=(out/'processing_report.md').read_text()
+            self.assertIn('Quality thresholds were bypassed using `--skip_quality_checks`',report)
+            self.assertIn('passes the stated thresholds: no',report)
+
+    def test_quality_bypass_does_not_hide_failed_scaling(self):
+        from pymda import assemble
+        with tempfile.TemporaryDirectory() as temp:
+            out=Path(temp)
+            prefix={'mtz':str(out/'input.mtz'),'last_frame':180,'statistics':{}}
+            record={'config':{'master':'one_master.h5'},'selected':prefix,'prefixes':[prefix]}
+            args=SimpleNamespace(prefix_policy='full',resolutions=[3.0],reso=1.8,thread=1,merge_workers=1,
+                min_completeness=90,min_outer_completeness=80,min_cc_half=.3,min_isigi=1,skip_quality_checks=True)
+            def fail(tools,paths,directory,resolution):
+                directory.mkdir(parents=True,exist_ok=True)
+                raise RuntimeError('Aimless failed')
+            with patch('pymda.scale',side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError,'No successful scaling trials'):
+                    assemble(object(),[record],out,args)
+            self.assertEqual(json.loads((out/'trials.json').read_text()),[])
+            self.assertFalse((out/'best/final.mtz').exists())
+            failures=list((out/'trials').glob('**/failure.json'))
+            self.assertEqual(len(failures),1)
+            self.assertEqual(json.loads(failures[0].read_text())['error'],'Aimless failed')
+
     def test_incomplete_summary_is_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             log=Path(temp)/'aimless.log'

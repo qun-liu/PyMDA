@@ -55,6 +55,8 @@ def options():
     p.add_argument('--prefix_policy', choices=['selected', 'cchalf', 'full', 'both', 'all'], default='all', help='Compare I/sigma-selected, CC-half-selected and full-scan prefixes')
     p.add_argument('--min_cc_half', type=float, default=0.3)
     p.add_argument('--min_isigi', type=float, default=1.0, help='Minimum outer-shell merged I/sigma(I)')
+    p.add_argument('--skip_quality_checks', action='store_true',
+                   help='Finalize successfully scaled data even when quality thresholds fail; retain measured statistics')
     p.add_argument('--nres', type=int, help='Known number of residues in the asymmetric unit')
     p.add_argument('--crystal_identity', choices=['unknown', 'repeat', 'independent'], default='unknown', help='Identity established by collection metadata; not inferred from unit cells')
     return p.parse_args()
@@ -71,7 +73,8 @@ def write_report(out, best, alternatives, records, identity='unknown'):
              'Processed %s rotation datasets with current DIALS and CCP4.' % len(records), '',
              '| Selection | Resolution (A) | I/sigma overall | I/sigma outer | CC-half outer | Completeness overall / outer (%) | Datasets |',
              '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
-    for label, result in [('Highest supported resolution', best)] + list(alternatives.items()):
+    selected_label = 'Selected result (thresholds bypassed)' if best.get('quality_checks_skipped') else 'Highest supported resolution'
+    for label, result in [(selected_label, best)] + list(alternatives.items()):
         s = result['statistics']
         lines.append('| %s | %.2f | %.1f | %.1f | %.3f | %.1f / %.1f | %s |' % (label, s['resolution'][0], s['isigi'][0], s['isigi'][2], s['cc_half'][2], s['completeness'][0], s['completeness'][2], len(result['crystals'])))
     lines += ['', 'Final amplitudes and CCP4 Free-R flags: `best/final.mtz`.',
@@ -79,6 +82,9 @@ def write_report(out, best, alternatives, records, identity='unknown'):
               'Thresholds: `%s`.' % json.dumps(best['thresholds'], sort_keys=True), '',
               'Chosen input scans and last included frame:', '']
     lines += ['- `%s`: frame %s' % pair for pair in zip(best['crystals'], best['last_frames'])]
+    if best.get('quality_checks_skipped'):
+        lines += ['', 'Quality thresholds were bypassed using `--skip_quality_checks`. Selected result passes the stated thresholds: %s.' %
+                  ('yes' if best['eligible'] else 'no')]
     identity_note = {'unknown': 'Crystal identity is unverified. This output establishes a multi-dataset merge and does not establish that the inputs are independent crystals.', 'repeat': 'The inputs were identified as repeat scans of one crystal. This output is a multi-dataset merge.', 'independent': 'The inputs were identified as independent crystals by the supplied collection information.'}[identity]
     if len(records) == 1:
         identity_note = 'This result uses one rotation dataset.'
@@ -381,18 +387,23 @@ def assemble(tools, records, out, args):
             s = r['statistics']
             writer.writerow([r['prefix_policy'], ';'.join(r['crystals']), ';'.join(map(str,r['last_frames'])), r['requested_resolution'], s['resolution'][0], s['isigi'][0], s['isigi'][2], s['cc_half'][2], s['completeness'][0], s['completeness'][2], r['eligible']])
     eligible = [x for x in results if x['eligible']]
-    if not eligible:
-        raise RuntimeError('No trial meets the stated quality thresholds; inspect trials.json')
-    best = min(eligible, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0], -x['statistics']['cc_half'][2]))
+    if not results:
+        raise RuntimeError('No successful scaling trials; inspect trial failure.json files and Pointless/Aimless logs')
+    skip_quality = getattr(args, 'skip_quality_checks', False)
+    candidates = results if skip_quality else eligible
+    if not candidates:
+        raise RuntimeError('No trial meets the stated quality thresholds; inspect trials.json or use --skip_quality_checks to finalize a successfully scaled result')
+    best = min(candidates, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0], -x['statistics']['cc_half'][2]))
+    best['quality_checks_skipped'] = skip_quality
     best['subset_search'] = {key: search[key] for key in ('mode','dataset_count','candidate_count','max_subsets')}
     best['thresholds'] = {'completeness_overall': args.min_completeness, 'completeness_outer': args.min_outer_completeness, 'cc_half_outer': args.min_cc_half, 'isigi_outer': args.min_isigi}
-    alternatives = {'strongest_signal': max(eligible, key=lambda x: (x['statistics']['isigi'][0], -x['statistics']['resolution'][0]))}
+    alternatives = {'strongest_signal': max(candidates, key=lambda x: (x['statistics']['isigi'][0], -x['statistics']['resolution'][0]))}
     extended = [x for x in results if x['statistics']['cc_half'][2] >= args.min_cc_half and x['statistics']['isigi'][2] >= args.min_isigi]
     if extended:
         alternatives['extended_resolution'] = min(extended, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0]))
     pareto = []
     strongest = float('-inf')
-    for candidate in sorted(eligible, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0])):
+    for candidate in sorted(candidates, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0])):
         if candidate['statistics']['isigi'][0] > strongest:
             pareto.append(candidate)
             strongest = candidate['statistics']['isigi'][0]
@@ -402,7 +413,7 @@ def assemble(tools, records, out, args):
         target.mkdir(parents=True, exist_ok=True)
         shutil.copy2(Path(candidate['directory'])/'scaled.mtz', target/'scaled.mtz')
         save(target/'selection.json', candidate)
-    complete = [x for x in eligible if x['statistics']['completeness'][0] >= 95]
+    complete = [x for x in candidates if x['statistics']['completeness'][0] >= 95]
     if complete:
         alternatives['completeness_95'] = min(complete, key=lambda x: (x['statistics']['resolution'][0], -x['statistics']['isigi'][0]))
     for label, alternative in alternatives.items():
